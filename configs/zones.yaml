@@ -1,0 +1,30 @@
+zones:
+  gowning_room:
+    polygon:
+      - [0, 0]
+      - [212, 0]
+      - [212, 359]
+      - [0, 359]
+
+    required_ppe: []
+
+  handwash:
+    polygon:
+      - [213, 0]
+      - [425, 0]
+      - [425, 359]
+      - [213, 359]
+
+    required_ppe: []
+
+  production:
+    polygon:
+      - [426, 0]
+      - [639, 0]
+      - [639, 359]
+      - [426, 359]
+
+    required_ppe:
+      - hairnet
+      - mask
+      - gloves
