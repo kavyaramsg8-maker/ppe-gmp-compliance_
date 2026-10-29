@@ -1,3 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+
+.venv-cloud/
+cloud_data/
+.env
+.env.cloud
+__pycache__/
+*.pyc

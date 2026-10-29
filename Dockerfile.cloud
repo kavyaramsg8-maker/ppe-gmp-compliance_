@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements-cloud.txt ./
+RUN pip install --no-cache-dir -r requirements-cloud.txt
+COPY cloud_backend ./cloud_backend
+COPY ml_adapter.py ./
+ENV PYTHONUNBUFFERED=1 PPE_DATA_DIR=/var/data
+EXPOSE 8000
+CMD ["python", "-m", "cloud_backend.serve"]
