@@ -1,0 +1,38 @@
+zones:
+
+  corridor:
+    # ========================================================
+    # HOW TO CHANGE: Change "CAM_01" to "CAM_02" to swap zones.
+    # HOW TO REVERT: Delete the entire 'camera_id' line below.
+    # (If deleted, the system will automatically go back to using 
+    # the 'polygon' coordinates to figure out the zone).
+    # ========================================================
+    camera_id: "CAM_01" 
+    
+    cleanliness_grade: general
+    authorized_ids: [17, 25]
+    required_ppe: []
+    polygon:
+      - [0, 0]
+      - [640, 0]
+      - [640, 480]
+      - [0, 480]
+
+  production:
+    # ========================================================
+    # HOW TO CHANGE: Change "CAM_02" to "CAM_01" to swap zones.
+    # HOW TO REVERT: Delete the 'camera_id' line.
+    # ========================================================
+    camera_id: "CAM_02"
+    
+    cleanliness_grade: sterile
+    authorized_ids: [17, 25]
+    required_ppe:
+      - hairnet
+      - mask
+      - gloves
+    polygon:
+      - [0, 0]
+      - [640, 0]
+      - [640, 480]
+      - [0, 480]

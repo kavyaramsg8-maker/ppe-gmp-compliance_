@@ -1,0 +1,35 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PPE Camera Upload</title><style>
+body{font:16px system-ui;margin:0;background:#101722;color:#edf2f9}main{max-width:700px;margin:auto;padding:24px}h1{font-size:26px}p{color:#b7c4d5;line-height:1.5}label{display:block;margin:15px 0 6px}input,select,button{font:inherit;padding:12px;border:1px solid #475569;border-radius:7px;background:#1e293b;color:white;box-sizing:border-box}input,select{width:100%}button{cursor:pointer;margin:16px 8px 12px 0;background:#176857}button:disabled{opacity:.5;cursor:default}video{width:100%;border-radius:8px;background:black}pre{white-space:pre-wrap;padding:16px;border-radius:8px;background:#1e293b}small{color:#b7c4d5}
+</style><main><h1>PPE camera connection</h1><p>This page sends sampled JPEG frames directly from this phone to the cloud backend. It does not run detection on the phone.</p>
+<label for="camera">Camera ID</label><select id="camera"></select>
+<label for="token">Shared API key</label><input id="token" type="password" autocomplete="off" placeholder="Enter the team API key">
+<button id="start">Start camera</button><button id="stop" disabled>Stop</button>
+<video id="video" playsinline muted autoplay></video><canvas id="canvas" hidden width="640" height="360"></canvas>
+<pre id="status" aria-live="polite">Stopped. Camera permission and HTTPS are required.</pre><small>Use one phone per camera ID. The key stays in page memory and is not saved in browser storage.</small></main>
+<script>
+const el=id=>document.getElementById(id);let stream=null,running=false,session=null,frame=0,controller=null;
+const headers=()=>({'X-API-Key':el('token').value});
+fetch('/camera-config').then(r=>r.json()).then(d=>d.cameras.forEach(id=>{let option=document.createElement('option');option.value=id;option.textContent=id;el('camera').append(option);})).catch(()=>el('status').textContent='Cannot load camera configuration.');
+async function postSession(){let r=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value)+'/sessions',{method:'POST',headers:headers()});if(!r.ok)throw Error('Session failed: '+r.status);session=(await r.json()).session_id;frame=0;}
+function stop(){running=false;if(controller)controller.abort();if(stream)stream.getTracks().forEach(t=>t.stop());el('start').disabled=false;el('stop').disabled=true;el('camera').disabled=false;el('token').disabled=false;el('status').textContent='Stopped. Backend decisions expire when frames stop.';}
+el('stop').onclick=stop;
+el('start').onclick=async()=>{try{
+ if(!navigator.mediaDevices?.getUserMedia)throw Error('Open the HTTPS cloud address. Camera access is unavailable on this origin.');
+ el('start').disabled=true;await postSession();stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:640},height:{ideal:360}},audio:false});el('video').srcObject=stream;await el('video').play();
+ running=true;el('stop').disabled=false;el('camera').disabled=true;el('token').disabled=true;
+ while(running){let start=Date.now();let v=el('video'),canvas=el('canvas');canvas.getContext('2d').drawImage(v,0,0,640,360);
+ let captured=new Date().toISOString();let blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.75));if(!running)break;
+ let body=new FormData();body.append('session_id',session);body.append('frame_id',String(frame++));body.append('captured_at',captured);body.append('image',blob,'frame.jpg');
+ controller=new AbortController();let timeout=setTimeout(()=>controller.abort(),12000);let r;
+ try{r=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value)+'/frames',{method:'POST',headers:headers(),body,signal:controller.signal});}finally{clearTimeout(timeout);}
+ if(!running)break;
+ if(r.status===409){await postSession();el('status').textContent='Started a new session after service reset.';}
+ else if(r.status===429){el('status').textContent='Detector busy. Dropping this sampled frame; no backlog.';}
+ else if(!r.ok){throw Error('Upload failed ('+r.status+'): '+await r.text());}
+ else{let s=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value),{headers:headers()});if(!s.ok)throw Error('Status request failed: '+s.status);let d=await s.json();el('status').textContent='Uploaded frame '+(frame-1)+'\nDecision: '+d.status+'\nLast processed: '+d.processed_frame_id+'\nStale: '+d.stale;}
+ await new Promise(resolve=>setTimeout(resolve,Math.max(100,1000-(Date.now()-start))));
+ }
+}catch(error){stop();el('status').textContent=error.message;}};
+window.addEventListener('pagehide',stop);
+</script></html>

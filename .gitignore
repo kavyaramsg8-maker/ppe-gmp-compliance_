@@ -1,0 +1,9 @@
+venv/
+.venv-cloud/
+__pycache__/
+*.pyc
+cloud_data/
+live_*.jpg
+*.db
+*.db-shm
+*.db-wal
