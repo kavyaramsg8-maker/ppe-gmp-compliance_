@@ -11,7 +11,7 @@ import time
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from demo_policy import PPE_ITEMS, PPE_CLASSES, WashTimer, zone_at, select_ppe, ppe_states
+from demo_policy import PPE_ITEMS, PPE_CLASSES, WashTimer, zone_at, select_ppe, ppe_states, camera_zone, handwash_roi
 
 ROOT=Path(__file__).resolve().parent
 _sessions={}
@@ -51,10 +51,15 @@ def _draw(frame,camera_id,people):
     top=52
     canvas=np.full((max(440,top+frame.shape[0]),1000,3),24,dtype=np.uint8)
     canvas[top:top+360,:640]=frame
-    for i,(name,c) in enumerate([('GOWNING',(180,150,60)),('HANDWASH',(180,100,50)),('PRODUCTION',(80,120,190))]):
-        x1=round(i*640/3);x2=round((i+1)*640/3)-1
-        cv2.rectangle(canvas,(x1,top),(x2,top+359),c,1)
-        cv2.putText(canvas,name,(x1+5,top+18),cv2.FONT_HERSHEY_SIMPLEX,.43,c,1)
+    if camera_id=='CAM_01':
+        cv2.putText(canvas,'CORRIDOR / GOWNING',(8,top+18),cv2.FONT_HERSHEY_SIMPLEX,.45,(210,190,90),1)
+        a,b,c,d=handwash_roi()
+        x1,y1,x2,y2=int(a*639),top+int(b*359),int(c*639),top+int(d*359)
+        cv2.rectangle(canvas,(x1,y1),(x2,y2),(200,140,60),2)
+        cv2.putText(canvas,'HANDWASH AREA',(x1+5,min(y2-5,y1+38)),cv2.FONT_HERSHEY_SIMPLEX,.45,(220,170,90),1)
+    else:
+        cv2.rectangle(canvas,(0,top),(639,top+359),(80,120,190),1)
+        cv2.putText(canvas,'PRODUCTION CAMERA',(8,top+18),cv2.FONT_HERSHEY_SIMPLEX,.5,(180,190,230),1)
     cv2.putText(canvas,f'{camera_id} | MODEL EVIDENCE - server verdict in monitor header',(10,26),cv2.FONT_HERSHEY_SIMPLEX,.48,(230,230,230),1)
     for i,p in enumerate(people):
         states=ppe_states(p['associated_ppe'])
@@ -73,7 +78,7 @@ def _draw(frame,camera_id,people):
         cv2.putText(canvas,f"Wash motion: {p['handwash_seconds']:.1f}s / {p['handwash_required_seconds']:.0f}s",(650,y+82),cv2.FONT_HERSHEY_SIMPLEX,.39,(210,210,210),1)
         face='UNKNOWN' if p['face_touch'] is None else 'TOUCH' if p['face_touch'] else 'CLEAR'
         cv2.putText(canvas,f'Face: {face}',(650,y+100),cv2.FONT_HERSHEY_SIMPLEX,.4,(200,200,200),1)
-    cv2.putText(canvas,'Yellow = unverified / non-production. Regions are configured demo areas.',(10,432),cv2.FONT_HERSHEY_SIMPLEX,.43,(200,200,200),1)
+    cv2.putText(canvas,'CAM_01: corridor + wash area. CAM_02: production. No cross-camera identity matching.',(10,432),cv2.FONT_HERSHEY_SIMPLEX,.43,(200,200,200),1)
     target=Path(os.environ.get('PPE_MONITOR_DIR',str(ROOT)));target.mkdir(parents=True,exist_ok=True)
     tmp=target/f'.live_{camera_id}.tmp.jpg'
     if not cv2.imwrite(str(tmp),canvas):raise RuntimeError('Could not write annotated monitor frame')
@@ -104,7 +109,7 @@ def detect(frame_content,camera_id,session_id):
         for b,tid in zip(tracked.boxes.xyxy.cpu().numpy(),tracked.boxes.id.cpu().numpy()):
             x1,y1,x2,y2=map(int,b);x1=max(0,x1);y1=max(0,y1);x2=min(639,x2);y2=min(359,y2)
             if (x2-x1)*(y2-y1)<2000:continue
-            tid=int(tid);foot=[(x1+x2)/2,y2];zone=zone_at(*foot)
+            tid=int(tid);foot=[(x1+x2)/2,y2];zone=camera_zone(camera_id,*foot,roi=handwash_roi())
             people.append({'track_id':tid,'box':[x1,y1,x2,y2],'foot_point':foot,'zone':zone,'associated_ppe':[]})
     # Assign an item to one person, not every overlapping person box.
     for d in candidates:
@@ -118,15 +123,15 @@ def detect(frame_content,camera_id,session_id):
             owner['associated_ppe'].append({'class':d['class'],'confidence':d['confidence']})
     for p in people:
         p['associated_ppe']=select_ppe(p['associated_ppe'],threshold)
-        st=session['people'].setdefault(p['track_id'],{'timer':WashTimer(required),'history':deque(maxlen=5),'seen':now})
-        if now-st['seen']>15:st.update(timer=WashTimer(required),history=deque(maxlen=5))
+        st=session['people'].setdefault(p['track_id'],{'timer':WashTimer(required),'history':deque(maxlen=5),'seen':now,'previous_zone':None,'wash_incomplete':False})
+        if now-st['seen']>15:st.update(timer=WashTimer(required),history=deque(maxlen=5),previous_zone=None,wash_incomplete=False)
         st['seen']=now
         x1,y1,x2,y2=p['box'];crop=frame[y1:y2,x1:x2]
         face,wrists=_pose_evidence(crop) if crop.size else (None,None)
         active=False
         if p['zone']=='handwash' and wrists is not None:
             a,b,shoulder=wrists
-            both_in_zone=all(zone_at(float(w[0]+x1),float(w[1]+y1))=='handwash' for w in (a,b))
+            both_in_zone=all(camera_zone(camera_id,float(w[0]+x1),float(w[1]+y1),roi=handwash_roi())=='handwash' for w in (a,b))
             center=(a+b)/2/shoulder
             st['history'].append((now,center))
             h=list(st['history'])
@@ -135,7 +140,11 @@ def detect(frame_content,camera_id,session_id):
                 active=any(abs(d)>.02 for d in delta) and any(delta[i]*delta[i-1]<0 for i in range(1,len(delta)))
         else:st['history'].clear()
         st['timer'].update(now,active)
-        p.update(face_touch=face,handwash_done=st['timer'].done,handwash_seconds=round(st['timer'].elapsed,2),handwash_required_seconds=required)
+        if st['previous_zone']=='handwash' and p['zone']=='corridor' and 0<st['timer'].elapsed<required:
+            st['wash_incomplete']=True
+        if st['timer'].done:st['wash_incomplete']=False
+        st['previous_zone']=p['zone']
+        p.update(handwash_incomplete=st['wash_incomplete'],face_touch=face,handwash_done=st['timer'].done,handwash_seconds=round(st['timer'].elapsed,2),handwash_required_seconds=required)
     session['people']={tid:st for tid,st in session['people'].items() if now-st['seen']<=15}
     _draw(frame,camera_id,people)
     target=Path(os.environ.get('PPE_MONITOR_DIR',str(ROOT)))

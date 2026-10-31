@@ -57,6 +57,14 @@ def main():
         parser.error('Detector must be callable')
     logging.basicConfig(level=logging.INFO)
     with httpx.Client(base_url=args.url.rstrip('/'), headers={'X-API-Key': key}, timeout=30) as client:
+        config=client.get('/camera-config')
+        config.raise_for_status()
+        config=config.json()
+        if 'handwash_roi' in config:
+            os.environ['PPE_HANDWASH_ROI']=json.dumps(config['handwash_roi'])
+        log.info('Server layout: %s; cameras: %s',config.get('zone_mode','production'),config.get('cameras'))
+        if args.detector=='ai_detector:detect' and config.get('zone_mode')!='cameras':
+            parser.error('This detector uses camera-based zones. Set PPE_ZONE_MODE=cameras on the backend, redeploy and restart.')
         while True:
             try:
                 process_once(client, detector)

@@ -58,3 +58,20 @@ class WashTimer:
             if 0 < dt <= 2.5:self.elapsed=min(self.required_seconds,self.elapsed+dt)
         self.last_time=now;self.last_active=active
         return self.elapsed
+
+
+def camera_zone(camera_id,x=None,y=None,roi=(.5,0,1,1)):
+    """CAM_01 corridor + handwash ROI; all of CAM_02 is production."""
+    if camera_id=='CAM_02':return 'production'
+    if camera_id!='CAM_01' or x is None or y is None:return 'outside'
+    if not(math.isfinite(x) and math.isfinite(y)) or not(0<=x<640 and 0<=y<=360):return 'outside'
+    a,b,c,d=roi
+    return 'handwash' if a<=x/640<=c and b<=y/360<=d else 'corridor'
+
+
+def handwash_roi():
+    import os,json
+    roi=tuple(float(v) for v in json.loads(os.environ.get('PPE_HANDWASH_ROI','[0.5,0,1,1]')))
+    if len(roi)!=4 or not(0<=roi[0]<roi[2]<=1 and 0<=roi[1]<roi[3]<=1):
+        raise ValueError('PPE_HANDWASH_ROI must be [left,top,right,bottom] between 0 and 1')
+    return roi

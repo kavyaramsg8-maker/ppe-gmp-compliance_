@@ -1,102 +1,112 @@
-# Restore the three-region phone demo
+# Correct two-camera layout
 
-The old `detect_and_track_live_FINAL.py` remains unchanged as a standalone reference.
-Use `ai_detector:detect` for phone uploads through the backend. Do not run both workers.
+This supersedes the previous equal-third layout. The earlier suggestion to divide
+a single image into gowning / handwash / production was wrong for this setup.
 
-## Render configuration (save and redeploy)
+- CAM_01: corridor / gowning camera, with a handwash region inside the same view.
+- CAM_02: separate production camera. Its entire image is production.
+- There is no production region on CAM_01 and no corridor/handwash region on CAM_02.
+- Two physical phones are needed for simultaneous two-camera capture.
 
-Keep the existing shared secret. Set:
+## Apply on laptop and deploy
+
+Stop both worker and monitor, and stop phone uploads. Back up tracked local changes
+using `git stash push -m "Before two-camera correction"`, then extract this ZIP into
+the project root, keeping its folder structure. No models, keys or video data are
+included in the ZIP. It contains replacement source files and regression tests.
+
+Push only the changed source files, not `.venv`, secrets, live frames or recordings.
+Deploy the new backend code before running this detector.
+
+Render Environment:
 
 ```
-PPE_CAMERA_IDS=CAM_01
-PPE_ZONE_MODE=three
+PPE_CAMERA_IDS=CAM_01,CAM_02
+PPE_ZONE_MODE=cameras
 PPE_CHECK_ACTIONS=false
 ```
 
-Start with actions disabled to verify PPE. The mode is shown on `/camera`.
-`CAM_01` now contains all three regions, not a hard-coded corridor/sink split.
-To add a second phone later, change `PPE_CAMERA_IDS` to `CAM_01,CAM_02`.
-Both views have independent trackers and their own three regions. This is not
-cross-camera re-identification or synchronized capture.
+Keep the existing API key privately. Save, deploy and wait for Live.
+Verify `/camera-config` reports both IDs and `zone_mode: cameras`.
 
-## Laptop commands (inside the project folder)
-
-Terminal 1, using the already working CV environment:
+Terminal 1 (project folder):
 
 ```bash
 source .venv/bin/activate
-# Copy the Render key privately, then:
+# If needed, copy the same Render API key privately, then:
 export PPE_API_KEY="$(pbpaste)"
 python -m cloud_backend.worker --url https://ppe-gmp-compliance.onrender.com --detector ai_detector:detect
 ```
 
-Open `https://ppe-gmp-compliance.onrender.com/camera` on the phone, refresh it,
-select CAM_01 and start a NEW session. Hold the phone landscape and fix it in place.
-The three equal-width regions are configured demonstration areas, not automatically
-recognized rooms. Person foot-point determines zone. Use a wide enough view to move
-between the three regions; a seated close-up spanning the image is unsuitable.
+The worker reads the configured handwash region from the backend at startup.
+It refuses to start this detector against an incompatible old layout.
+
+On phone 1, refresh `/camera`, choose CAM_01 and Start. On phone 2, choose CAM_02
+and Start. Keep phone cameras fixed, landscape and foregrounded.
 
 Terminal 2:
 
 ```bash
 source .venv/bin/activate
-python monitor.py --cameras CAM_01 --record demo.mp4
+python monitor.py --cameras CAM_01,CAM_02 --record demo.mp4
 ```
 
-Press q in the monitor image window to finalize `demo.mp4`. Check disk space first.
-This records the monitor, without audio. macOS Shift-Command-5 can record narration
-and the other application windows instead.
+The monitor displays separate camera views stacked vertically. Press q in its image
+window to finalize demo.mp4 (no audio). Without `--record` it only displays video.
 
-No new MediaPipe install is needed: pose uses the already committed YOLO pose weights.
-The detector still needs ultralytics, OpenCV, NumPy and httpx in this environment.
-If ultralytics requests its tracking dependency, use the same environment to install
-that dependency and restart the worker.
+## Handwash region
 
-## What the display means
+Default: the right half of CAM_01, preserving Ujwal's original arrangement. The
+outline is just a configured region; it must cover the actual sink area in the
+fixed camera view. Set `PPE_HANDWASH_ROI=[left,top,right,bottom]` on Render to adjust
+it, with normalized coordinates between 0 and 1. Example `[0.5,0,1,1]` is the right
+half. Redeploy and restart the worker after changing it. Person foot-point assigns
+the zone, and both visible wrists must be in the wash region for motion evidence.
+There is no automatic sink recognition.
 
-- One row each for hairnet, mask and gloves. Scores are retained and shown.
-- Green person outline: current model evidence verifies all production PPE.
-- Red: current model evidence explicitly detects missing production PPE.
-- Yellow: unverified or exempt-zone evidence. No missing detection is invented.
-- The BACKEND header is the server's temporally confirmed decision, not the outline.
-- MONITORING means a person is in gowning/handwash, where PPE is not required.
-  This does not claim verified PPE compliance and does not enable overall green.
-- Contradictory present/absent scores within 0.10 are unknown. Detections below
-  0.50 are not sent as reliable labels. False confident model predictions can remain.
-- Leaving a zone closes its incidents with ZONE_EXIT, not a claim that PPE was restored.
-- A stopped source becomes UNKNOWN, even if an older JPEG is still on disk.
+## Decisions and colours
 
-## Face touch and handwash
+One scored row per PPE item. Missing evidence is yellow/unknown, not automatically
+missing PPE. Close contradictory predictions are unknown. Green/red person outlines
+represent current PPE model evidence in production. The BACKEND header is the
+server's temporally confirmed verdict. CAM_01 ordinarily shows MONITORING, which
+means no production PPE requirement applies there, not verified PPE compliance.
 
-These are visible as pose-based heuristics. To include them in production alerts,
-set `PPE_CHECK_ACTIONS=true` on Render and redeploy after PPE works.
-Handwash is a hand-motion proxy in the middle region, not proof of washing or hygiene.
-Only observed active intervals count. Default target is 20 seconds; gaps over 2.5s
-are not counted. Low upload/inference rates may make this proxy unreliable. To use
-an accelerated demonstration, set `PPE_HANDWASH_SECONDS=5` in the worker terminal
-and label it explicitly as an accelerated demo. It is not a five-second hygiene rule.
-Completion is remembered only for this camera + session + track. Reconnects, track
-loss or another camera do not preserve it; do not claim cross-camera gowning history.
-Gowning-order enforcement from the old standalone script is not restored here.
+A violation on either camera makes the ESP32 command red. Overall green needs
+fresh verified production compliance on CAM_02 and a fresh non-violating monitored
+CAM_01. Disconnected/unknown cameras never enable green.
 
-## Validation before recording
+## Optional handwash and face-touch alerts
 
-1. Empty view -> NO_PERSON (no green).
-2. In production, reliable maskoff -> PENDING then VIOLATION after 3/5 frames.
-3. Reliable maskon plus other required items -> recovery after 3 present frames.
-4. Obscured items -> UNKNOWN; unknown does not clear an active production incident.
-5. Move out of production -> MONITORING; no production-only requirement there.
-6. Stop phone -> UNKNOWN after 15 seconds; verify ESP32 independently if connected.
+First verify PPE with PPE_CHECK_ACTIONS=false. To exercise action heuristics, set it
+true on Render and redeploy. CAM_01 can report an incomplete wash after an observed
+partial washing attempt followed by leaving the handwash region. CAM_02 evaluates
+PPE and face touch. It does NOT assume CAM_02's track 1 is CAM_01's track 1 or demand
+that CAM_02 prove completion from another camera.
 
-The model weights have not been retrained. Verify gloves with real positive/negative
-examples; a bare hand labelled glove is a model error, not successful compliance.
-Laptop inference + Render backend is a hybrid demo, not cloud-hosted inference.
-The Streamlit dashboard's old local-database path does not read Render events.
+Handwashing is a pose/motion proxy, not proof of hygiene. The default target is 20s
+of observed active intervals. Missing observations and gaps over 2.5s do not count.
+This proxy needs adequate sampling and visibility. No cross-camera handwash sequence
+or gowning order is verified. Track loss/reconnect resets camera-local action history.
 
-## Tests
+## Remaining model issue
 
-Run `python -m pytest tests_cloud test_smoothing_basic.py -q` with API test
-dependencies plus NumPy/OpenCV. The detector tests use controlled model doubles;
-they do not establish model accuracy. `test_zones_basic.py` on the original main
-branch imports `point_in_polygon`, which the current `rule_engine/zones.py` does
-not export. That pre-existing collection failure is outside these cloud-demo fixes.
+The model names match the adapter, but this does not establish correct training labels
+or accurate predictions. The hairnet/glove confusion still needs raw-image verification
+and may require correcting the dataset and retraining. No class names were swapped to
+hide it, and no model weights were changed. Keep a real positive/negative PPE test set.
+
+## Validation
+
+22 targeted tests passed in the build environment, using controlled detections for
+model-dependent code. They verify layout, backend rules, camera/session isolation,
+confidence handling and stale results; they do not verify live detection accuracy.
+The full original suite still cannot collect test_zones_basic.py because its existing
+rule_engine.zones module does not export point_in_polygon. That legacy issue is separate.
+Run `python -m pytest tests_cloud test_smoothing_basic.py -q` with API-test dependencies,
+NumPy and OpenCV installed. This patch adds no MediaPipe dependency.
+
+Inference still runs on the laptop while Render hosts the API. This remains a hybrid
+demo until model inference is deployed to cloud compute. Physical ESP32 alerts need
+independent wiring/firmware testing. The old Streamlit local-DB dashboard does not
+read the remote Render database automatically.

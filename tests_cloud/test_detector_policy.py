@@ -68,7 +68,7 @@ def test_detector_returns_one_scored_label_per_item_and_tracks_people_only(monke
     monkeypatch.setenv('PPE_MONITOR_DIR',str(tmp_path))
     sys.modules.pop('ai_detector',None);d=importlib.import_module('ai_detector')
     ok,encoded=cv2.imencode('.jpg',np.zeros((360,640,3),dtype=np.uint8));assert ok
-    people=d.detect(encoded.tobytes(),'CAM_01','s')
+    people=d.detect(encoded.tobytes(),'CAM_02','s')
     assert len(people)==1 and people[0]['zone']=='production'
     assert people[0]['associated_ppe']==[{'class':'maskon','confidence':.9}]
-    assert (tmp_path/'live_CAM_01.jpg').exists()
+    assert (tmp_path/'live_CAM_02.jpg').exists()
