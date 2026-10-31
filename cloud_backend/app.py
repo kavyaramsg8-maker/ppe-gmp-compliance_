@@ -22,6 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator
 
 from ml_adapter import MLAdapter
+from demo_policy import zone_at
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,12 @@ class Settings:
     voting_n: int = 5
     recovery_frames: int = 3
     max_image_bytes: int = 2 * 1024 * 1024
+    zone_mode: str = 'production'
+    check_actions: bool = False
 
     def __post_init__(self):
+        if self.zone_mode not in ('production', 'three'):
+            raise ValueError('PPE_ZONE_MODE must be production or three')
         if len(self.api_key) < 32:
             raise ValueError('PPE_API_KEY must contain at least 32 characters')
         if not self.cameras or len(set(self.cameras)) != len(self.cameras):
@@ -49,7 +54,9 @@ class Settings:
         return cls(api_key=os.environ.get('PPE_API_KEY', ''),
                    data_dir=Path(os.environ.get('PPE_DATA_DIR', 'cloud_data')),
                    cameras=tuple(c.strip() for c in os.environ.get('PPE_CAMERA_IDS', 'CAM_01,CAM_02').split(',') if c.strip()),
-                   stale_seconds=int(os.environ.get('PPE_STALE_SECONDS', '15')))
+                   stale_seconds=int(os.environ.get('PPE_STALE_SECONDS', '15')),
+                   zone_mode=os.environ.get('PPE_ZONE_MODE', 'production'),
+                   check_actions=os.environ.get('PPE_CHECK_ACTIONS', 'false').lower() == 'true')
 
 
 class Detection(BaseModel):
@@ -59,6 +66,9 @@ class Detection(BaseModel):
 
 class Person(BaseModel):
     track_id: int = Field(ge=0)
+    foot_point: tuple[float, float] | None = None
+    face_touch: bool | None = None
+    handwash_done: bool | None = None
     associated_ppe: list[str | Detection] = Field(default_factory=list, max_length=50)
 
     @field_validator('associated_ppe')
@@ -155,7 +165,7 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
 
     @app.get('/camera-config', include_in_schema=False)
     def camera_config():
-        return {'cameras': settings.cameras}
+        return {'cameras': settings.cameras, 'zone_mode': settings.zone_mode, 'check_actions': settings.check_actions}
 
     @app.get('/healthz')
     def health():
@@ -251,8 +261,19 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
                 ppe = adapter.update(person.track_id, detections, observation.frame_id)
                 t = tracks.setdefault(person.track_id, {'last_seen': now(), 'items': {}})
                 t['last_seen'] = now()
-                for item in settings.required_ppe:
-                    v = ppe[item]
+                zone = 'production' if settings.zone_mode == 'production' else zone_at(*person.foot_point) if person.foot_point else 'outside'
+                # Clear location-specific incidents on exit; do not call this PPE recovery.
+                if t.get('zone') != zone:
+                    for old_item, old in t['items'].items():
+                        if old['active']: record(c, camera_id, person.track_id, old_item, 'ZONE_EXIT')
+                    t['items'] = {}
+                t['zone'] = zone
+                evaluated = {i: ppe[i] for i in settings.required_ppe} if zone == 'production' else {}
+                if settings.check_actions and zone == 'production':
+                    evaluated['face_touch'] = 'not_detected' if person.face_touch is None else 'missing' if person.face_touch else 'present'
+                    # Handwashing can only be carried within this camera/session/track.
+                    evaluated['handwash'] = 'not_detected' if person.handwash_done is None else 'present' if person.handwash_done else 'missing'
+                for item, v in evaluated.items():
                     item_state = t['items'].setdefault(item, {'votes': deque(maxlen=settings.voting_n), 'clear': 0, 'active': None})
                     item_state['votes'].append(v == 'missing' if v != 'not_detected' else None)
                     item_state['clear'] = item_state['clear'] + 1 if v == 'present' else 0
@@ -263,16 +284,20 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
                         record(c, camera_id, person.track_id, item, 'RECOVERY')
                         item_state['active'] = None
                         item_state['votes'].clear()
-                rows.append({'track_id': person.track_id, 'ppe': {i: ppe[i] for i in settings.required_ppe}})
+                rows.append({'track_id': person.track_id, 'zone': zone, 'ppe': {i: ppe[i] for i in settings.required_ppe}, 'evaluated': evaluated, 'handwash_done': person.handwash_done, 'face_touch': person.face_touch})
             active = [{'track_id': tid, 'item': item, 'event_id': v['active']}
                       for tid, t in tracks.items() for item, v in t['items'].items() if v['active']]
             if active:
                 status = 'VIOLATION'
             elif not rows:
                 status = 'NO_PERSON'
-            elif any(v == 'not_detected' for p in rows for v in p['ppe'].values()):
+            elif any(p['zone'] == 'outside' for p in rows):
                 status = 'UNKNOWN'
-            elif any(v == 'missing' for p in rows for v in p['ppe'].values()):
+            elif not any(p['evaluated'] for p in rows):
+                status = 'MONITORING'
+            elif any(v == 'not_detected' for p in rows for v in p['evaluated'].values()):
+                status = 'UNKNOWN'
+            elif any(v == 'missing' for p in rows for v in p['evaluated'].values()):
                 status = 'PENDING'
             else:
                 status = 'COMPLIANT'
@@ -357,3 +382,4 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
             return Response(row['snapshot'], media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
 
     return app
+

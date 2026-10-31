@@ -4,6 +4,9 @@ import importlib
 import logging
 import os
 import time
+import json
+from pathlib import Path
+from hashlib import sha256
 import httpx
 
 log = logging.getLogger(__name__)
@@ -29,6 +32,13 @@ def process_once(client, detector):
             log.info('Dropped expired or superseded result for %s', camera_id)
             continue
         result.raise_for_status()
+        # Monitor consumes the actual server verdict, matched to this JPEG.
+        folder=Path(os.environ.get('PPE_MONITOR_DIR',str(Path(__file__).resolve().parent.parent)))
+        folder.mkdir(parents=True,exist_ok=True)
+        name=''.join(ch for ch in camera_id if ch.isalnum() or ch in '_-')
+        path=folder/f'live_{name}.decision.json'; tmp=path.with_suffix('.tmp')
+        value=result.json(); value['source_sha256']=sha256(frame.content).hexdigest()
+        tmp.write_text(json.dumps(value)); os.replace(tmp,path)
         processed += 1
     return processed
 
@@ -58,3 +68,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
