@@ -1,5 +1,8 @@
 import yaml
 
+# Shared ray-casting test (also used by the cloud zone policy).
+from cloud_backend.zone_policy import point_in_polygon  # noqa: F401
+
 def load_zones(filepath="configs/zones.yaml"):
     with open(filepath, "r") as f:
         data = yaml.safe_load(f)

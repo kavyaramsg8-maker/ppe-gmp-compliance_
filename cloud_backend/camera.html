@@ -1,38 +1,73 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="ppe-page-version" content="2026-11-02.2">
 <title>PPE Camera Upload</title><style>
 body{font:16px system-ui;margin:0;background:#101722;color:#edf2f9}main{max-width:700px;margin:auto;padding:24px}h1{font-size:26px}p{color:#b7c4d5;line-height:1.5}label{display:block;margin:15px 0 6px}input,select,button{font:inherit;padding:12px;border:1px solid #475569;border-radius:7px;background:#1e293b;color:white;box-sizing:border-box}input,select{width:100%}button{cursor:pointer;margin:16px 8px 12px 0;background:#176857}button:disabled{opacity:.5;cursor:default}video{width:100%;border-radius:8px;background:black}pre{white-space:pre-wrap;padding:16px;border-radius:8px;background:#1e293b}small{color:#b7c4d5}
 </style><main><h1>PPE camera connection</h1><p>This page sends sampled JPEG frames directly from this phone to the cloud backend. It does not run detection on the phone.</p>
+<p id="zones"></p>
 <label for="camera">Camera ID</label><select id="camera"></select>
 <label for="fps">Target upload rate (processed FPS may be lower)</label><select id="fps"><option value="3">3 frames/s</option><option value="5" selected>5 frames/s</option><option value="8">8 frames/s</option></select>
 <label for="token">Shared API key</label><input id="token" type="password" autocomplete="off" placeholder="Enter the team API key">
 <button id="start">Start camera</button><button id="stop" disabled>Stop</button>
-<video id="video" playsinline muted autoplay></video><canvas id="canvas" hidden width="640" height="360"></canvas>
-<pre id="status" aria-live="polite">Stopped. Camera permission and HTTPS are required.</pre><small>Use one phone per camera ID. The key stays in page memory and is not saved in browser storage.</small></main>
+<video id="video" playsinline muted autoplay></video><canvas id="canvas" hidden></canvas>
+<pre id="status" aria-live="polite">Stopped. Camera permission and HTTPS are required.</pre><small>Page version 2026-11-02.2. Use one phone per camera ID and keep it fixed in the orientation used for zone calibration. The key stays in page memory and is not saved in browser storage.</small></main>
 <script>
-const el=id=>document.getElementById(id);let stream=null,running=false,session=null,frame=0,controller=null,statusTimer=null,statusBusy=false,accepted=0,startedAt=0;
+const el=id=>document.getElementById(id);
+const MAX_SIDE=640,MAX_IN_FLIGHT=2,TIMEOUT_MS=8000;
+let stream=null,running=false,session=null,frame=0,timer=null,statusTimer=null,statusBusy=false,restarting=false,wakeLock=null,decision='-';
+let c={sent:0,accepted:0,skipped:0,dropped:0,busy:0,netErr:0},inFlight=new Set(),rtts=[],startedAt=0;
 const headers=()=>({'X-API-Key':el('token').value});
-fetch('/camera-config').then(r=>r.json()).then(d=>d.cameras.forEach(id=>{let option=document.createElement('option');option.value=id;option.textContent=id;el('camera').append(option);})).catch(()=>el('status').textContent='Cannot load camera configuration.');
-async function postSession(){let r=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value)+'/sessions',{method:'POST',headers:headers()});if(!r.ok)throw Error('Session failed: '+r.status);session=(await r.json()).session_id;frame=0;}
-async function pollStatus(){if(!running||statusBusy)return;statusBusy=true;try{let s=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value),{headers:headers()});if(s.ok){let d=await s.json();el('status').textContent='Accepted uploads/s: '+(accepted/Math.max(1,(Date.now()-startedAt)/1000)).toFixed(1)+'\nDecision: '+d.status+'\nLast processed: '+d.processed_frame_id+'\nStale: '+d.stale;}}catch(e){}finally{statusBusy=false;}}
-function stop(){running=false;if(statusTimer)clearInterval(statusTimer);if(controller)controller.abort();if(stream)stream.getTracks().forEach(t=>t.stop());el('start').disabled=false;el('stop').disabled=true;el('camera').disabled=false;el('token').disabled=false;el('status').textContent='Stopped. Backend decisions expire when frames stop.';}
+const camPath=()=>'/v1/cameras/'+encodeURIComponent(el('camera').value);
+fetch('/camera-config').then(r=>r.json()).then(d=>{
+ el('zones').textContent=d.api_version?'Backend '+d.api_version+'. Zones are configured per camera on the server (CAM_01 corridor with handwash area, CAM_02 production).':'Old backend version without per-camera zone configuration.';
+ d.cameras.forEach(id=>{let o=document.createElement('option');o.value=id;o.textContent=id;el('camera').append(o);});
+}).catch(()=>el('status').textContent='Cannot load camera configuration.');
+async function postSession(){let r=await fetch(camPath()+'/sessions',{method:'POST',headers:headers()});if(!r.ok)throw Error('Session failed: '+r.status);session=(await r.json()).session_id;frame=0;}
+function median(a){if(!a.length)return null;let s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)];}
+function show(){let secs=Math.max(1,(Date.now()-startedAt)/1000);
+ el('status').textContent=`Uploads accepted: ${(c.accepted/secs).toFixed(1)}/s (target ${el('fps').value}/s)\nIn flight: ${inFlight.size}  skipped (network busy): ${c.skipped}  rejected old: ${c.dropped}  errors: ${c.netErr}${c.busy?'  busy(429): '+c.busy:''}\nUpload time p50: ${median(rtts)??'-'} ms\nBackend decision: ${decision}`;}
+async function pollStatus(){if(!running||statusBusy)return;statusBusy=true;
+ try{let s=await fetch(camPath(),{headers:headers()});if(s.ok){let d=await s.json();decision=`${d.status} | processed frame ${d.processed_frame_id} of ${d.latest_frame_id}${d.stale?' | STALE':''}`;}}catch(e){}finally{statusBusy=false;show();}}
+async function restartSession(){if(restarting)return;restarting=true;try{await postSession();}catch(e){c.netErr++;}finally{restarting=false;}}
+async function upload(blob,id,sid,captured){
+ let body=new FormData();body.append('session_id',sid);body.append('frame_id',String(id));body.append('captured_at',captured);body.append('image',blob,'frame.jpg');
+ let ctl=new AbortController(),t0=performance.now(),to=setTimeout(()=>ctl.abort(),TIMEOUT_MS);inFlight.add(ctl);c.sent++;
+ try{let r=await fetch(camPath()+'/frames',{method:'POST',headers:headers(),body,signal:ctl.signal});
+  if(r.ok){c.accepted++;rtts.push(Math.round(performance.now()-t0));if(rtts.length>30)rtts.shift();}
+  else if(r.status===409){let detail=(await r.json().catch(()=>({}))).detail||'';
+   // Only an expired CURRENT session needs a new one; an out-of-order upload is just dropped.
+   if(/Session/i.test(detail)&&sid===session)await restartSession();else c.dropped++;}
+  else if(r.status===429)c.busy++;
+  else if(r.status===401){stop();el('status').textContent='API key rejected.';}
+  else if(r.status===422){c.netErr++;el('status').textContent='Rejected: '+((await r.json().catch(()=>({}))).detail||r.status)+'\nCheck the phone clock is set automatically.';}
+  else c.netErr++;
+ }catch(e){if(running)c.netErr++;}finally{clearTimeout(to);inFlight.delete(ctl);}
+}
+function tick(){if(!running)return;
+ let interval=1000/Number(el('fps').value);timer=setTimeout(tick,interval);
+ // Bounded: never queue frames behind a slow network; skip and count instead.
+ if(inFlight.size>=MAX_IN_FLIGHT||restarting||!session){c.skipped++;return;}
+ let v=el('video');if(!v.videoWidth)return;
+ // Native aspect ratio, no letterbox bars: zones are calibrated on the real picture.
+ let s=Math.min(1,MAX_SIDE/Math.max(v.videoWidth,v.videoHeight)),cv=el('canvas');
+ cv.width=Math.round(v.videoWidth*s);cv.height=Math.round(v.videoHeight*s);
+ let captured=new Date().toISOString();cv.getContext('2d').drawImage(v,0,0,cv.width,cv.height);
+ let id=frame++,sid=session;
+ cv.toBlob(b=>{if(b&&running)upload(b,id,sid,captured);},'image/jpeg',.75);
+}
+function stop(){running=false;clearTimeout(timer);clearInterval(statusTimer);inFlight.forEach(ctl=>ctl.abort());
+ if(stream)stream.getTracks().forEach(t=>t.stop());if(wakeLock)wakeLock.release().catch(()=>{});wakeLock=null;
+ el('start').disabled=false;el('stop').disabled=true;el('camera').disabled=false;el('token').disabled=false;
+ el('status').textContent='Stopped. Backend decisions expire when frames stop.';}
 el('stop').onclick=stop;
 el('start').onclick=async()=>{try{
  if(!navigator.mediaDevices?.getUserMedia)throw Error('Open the HTTPS cloud address. Camera access is unavailable on this origin.');
- el('start').disabled=true;await postSession();stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:640},height:{ideal:360}},audio:false});el('video').srcObject=stream;await el('video').play();
- running=true;accepted=0;startedAt=Date.now();statusTimer=setInterval(pollStatus,1000);el('stop').disabled=false;el('camera').disabled=true;el('token').disabled=true;
- while(running){let start=Date.now();let v=el('video'),canvas=el('canvas');let ctx=canvas.getContext('2d');let scale=Math.min(640/v.videoWidth,360/v.videoHeight);let w=v.videoWidth*scale,h=v.videoHeight*scale;ctx.fillStyle='black';ctx.fillRect(0,0,640,360);ctx.drawImage(v,(640-w)/2,(360-h)/2,w,h);
- let captured=new Date().toISOString();let blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.75));if(!running)break;
- let body=new FormData();body.append('session_id',session);body.append('frame_id',String(frame++));body.append('captured_at',captured);body.append('image',blob,'frame.jpg');
- controller=new AbortController();let timeout=setTimeout(()=>controller.abort(),12000);let r;
- try{r=await fetch('/v1/cameras/'+encodeURIComponent(el('camera').value)+'/frames',{method:'POST',headers:headers(),body,signal:controller.signal});}finally{clearTimeout(timeout);}
- if(!running)break;
- if(r.status===409){await postSession();el('status').textContent='Started a new session after service reset.';}
- else if(r.status===429){el('status').textContent='Detector busy. Dropping this sampled frame; no backlog.';}
- else if(!r.ok){throw Error('Upload failed ('+r.status+'): '+await r.text());}
- else{accepted++;}
- await new Promise(resolve=>setTimeout(resolve,Math.max(10,1000/Number(el('fps').value)-(Date.now()-start))));
- }
+ el('start').disabled=true;await postSession();
+ stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:640},height:{ideal:480}},audio:false});
+ el('video').srcObject=stream;await el('video').play();
+ try{wakeLock=await navigator.wakeLock?.request('screen');}catch(e){}
+ running=true;c={sent:0,accepted:0,skipped:0,dropped:0,busy:0,netErr:0};rtts=[];startedAt=Date.now();
+ statusTimer=setInterval(pollStatus,1000);el('stop').disabled=false;el('camera').disabled=true;el('token').disabled=true;tick();
 }catch(error){stop();el('status').textContent=error.message;}};
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&running){stop();el('status').textContent='Stopped because the page was hidden. Keep this page in the foreground.';}});
 window.addEventListener('pagehide',stop);
 </script></html>
-

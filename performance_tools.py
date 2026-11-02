@@ -37,16 +37,48 @@ def describe(values):
     return {'mean':statistics.mean(a),'p50':percentile(.5),'p95':percentile(.95),'max':a[-1]}
 
 
+def _first(row,*keys):
+    return next((row[k] for k in keys if row.get(k) is not None),None)
+
+
+def camera_summary(rows):
+    """Steadiness of accepted results for one camera, from their recorded_at times."""
+    accepted=[r for r in rows if r.get('accepted',True)]
+    times=sorted(datetime.fromisoformat(r['recorded_at']).timestamp() for r in accepted if r.get('recorded_at'))
+    gaps=[(b-a)*1000 for a,b in zip(times,times[1:])]
+    interval=describe(gaps)
+    spread=statistics.pstdev(gaps) if len(gaps)>1 else None
+    ids=sorted(r['frame_id'] for r in accepted if isinstance(r.get('frame_id'),int))
+    return {'accepted_frames':len(accepted),'rejected_or_failed':len(rows)-len(accepted),
+            'accepted_fps':(len(times)-1)/(times[-1]-times[0]) if len(times)>1 and times[-1]>times[0] else None,
+            'interval_ms':interval,'interval_cv':spread/interval['mean'] if spread is not None and interval['mean'] else None,
+            # Uploaded frame IDs never processed (phone uploads faster than the pipeline, or network loss).
+            'uploaded_frames_skipped':sum(b-a-1 for a,b in zip(ids,ids[1:]) if b>a),
+            'detector_ms':describe([r.get('detector_ms') for r in accepted]),
+            'fetch_ms':describe([_first(r,'fetch_ms','download_ms') for r in accepted]),
+            'submit_ms':describe([r.get('submit_ms') for r in accepted]),
+            'gate_wait_ms':describe([_first(r,'gate_wait_ms','lock_wait_ms') for r in accepted]),
+            'server_wait_ms':describe([r.get('server_wait_ms') for r in accepted]),
+            'age_at_fetch_ms':describe([r.get('age_at_fetch_ms') for r in accepted]),
+            # Worker-side clock after the decision returns: comparable across old/new workers.
+            'capture_to_decision_ms':describe([_first(r,'age_at_decision_ms','capture_age_ms') for r in accepted]),
+            'server_capture_to_decision_ms':describe([r.get('server_capture_to_decision_ms') for r in accepted]),
+            'dropped_before_inference':max([r.get('dropped_before_inference',0) for r in rows] or [0]),
+            'dropped_before_submit':max([r.get('dropped_before_submit',0) for r in rows] or [0])}
+
+
 def summarize(rows,elapsed_seconds):
     accepted=[r for r in rows if r.get('accepted',True)]
     memory=[r['rss_mib'] for r in rows if r.get('rss_mib') is not None]
+    cameras=sorted({r.get('camera_id','unknown') for r in rows})
     return {'attempted_frames':len(rows),'accepted_frames':len(accepted),
             'elapsed_seconds':elapsed_seconds,'accepted_fps':len(accepted)/elapsed_seconds if elapsed_seconds>0 else None,
-            'per_camera_accepted_fps':{c:sum(r.get('camera_id')==c for r in accepted)/elapsed_seconds for c in sorted({r.get('camera_id','unknown') for r in rows})} if elapsed_seconds>0 else {},
+            'per_camera_accepted_fps':{c:sum(r.get('camera_id')==c for r in accepted)/elapsed_seconds for c in cameras} if elapsed_seconds>0 else {},
             'detector_ms':describe([r.get('detector_ms') for r in accepted]),
-            'cycle_ms':describe([r.get('cycle_ms') for r in accepted]),
-            'capture_age_ms':describe([r.get('capture_age_ms') for r in accepted]),
-            'inference_lock_wait_ms':describe([r.get('lock_wait_ms') for r in rows]),
+            'cycle_ms':describe([_first(r,'local_cycle_ms','cycle_ms') for r in accepted]),
+            'capture_age_ms':describe([_first(r,'age_at_decision_ms','capture_age_ms') for r in accepted]),
+            'inference_lock_wait_ms':describe([_first(r,'gate_wait_ms','lock_wait_ms') for r in rows]),
+            'per_camera':{c:camera_summary([r for r in rows if r.get('camera_id','unknown')==c]) for c in cameras},
             'peak_rss_mib':max(memory) if memory else None}
 
 

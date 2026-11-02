@@ -1,5 +1,10 @@
 # PPE performance update — demo-setup / Mac
 
+> **Update (branch `fix/live-pipeline-zones`):** for running the live demo, use `LIVE_DEMO_RUNBOOK.md`. The installer
+> steps below are already applied. The "existing branch limitations" at the end (backend ignores
+> handwash/face-touch fields, fixed right-half sink rule, wall-clock wash timer) are fixed on that branch.
+> Benchmark instructions here remain valid.
+
 This is a small overlay, **not a full repository**. It targets demo-setup commit `2ee36267bd7129ae2d50700e80bb653cea895f8e`. Keep your existing weights and working Python 3.11 virtual environment. No model weights or credentials are included.
 
 ## 1. Apply safely (10 minutes)

@@ -7,8 +7,9 @@ This is a small-team demo trust boundary, not separate production roles.
 
 ## Ujju — camera upload
 Open the cloud HTTPS address `/camera` on each phone. Choose different IDs and
-enter the key privately. Press Start and allow camera access. This sends one
-640×360 JPEG per second, directly from the phone. Keep the page foregrounded.
+enter the key privately. Press Start and allow camera access. This sends JPEGs at
+the selected rate (3/5/8 per second, longest side 640 px, native aspect ratio, no
+letterbox bars), directly from the phone, with at most two uploads in flight. Keep the page foregrounded.
 Phone clocks must be accurate; captures older than 15 seconds are rejected.
 The browser key is not stored. The server uses a single latest frame per camera.
 The configured IDs come from PPE_CAMERA_IDS, default CAM_01,CAM_02.
@@ -16,9 +17,12 @@ The configured IDs come from PPE_CAMERA_IDS, default CAM_01,CAM_02.
 For a custom sender:
 1. POST `/v1/cameras/CAM_01/sessions` → session_id.
 2. POST multipart `/v1/cameras/CAM_01/frames`: session_id, integer frame_id
-   starting at 0 and increasing, timezone-aware captured_at, image (JPEG).
-3. On 429 drop this sample and try again later: detector has a processing lease.
-   Do not queue old frames. On 409 obtain a new session (one sender per ID).
+   starting at 0 and increasing, timezone-aware captured_at, image (JPEG), and
+   optional content_box "left,top,right,bottom" (pixels) if the JPEG contains
+   letterbox bars. Each upload replaces any unprocessed one (latest-frame slot);
+   uploads are never blocked by inference. Do not queue old frames.
+3. 409 "Session expired" → obtain a new session (one sender per ID).
+   409 "Duplicate or out-of-order" → that upload was dropped; continue.
 4. GET `/v1/cameras/CAM_01` to see its latest decision.
 
 ## Aravind — actual cloud detection
@@ -59,11 +63,21 @@ export PPE_DETECTOR=aravind_inference:infer
 python -m cloud_backend.worker --url http://127.0.0.1:8000
 ```
 
-The worker GETs `/v1/cameras`, fetches `/v1/cameras/{id}/frame` with
-`X-Claim-Frame: true`, reads X-Frame-ID and X-Session-ID response headers, then
-POSTs `/v1/cameras/{id}/observations`. The claim blocks new uploads for up to
-10 seconds while inference runs. Only a result matching the latest session/frame
-is accepted. It must also arrive within the 15-second freshness limit.
+Per camera, the worker long-polls `GET /v1/cameras/{id}/frame?after=<last id>&session=<id>&wait=5`
+with `X-Claim-Frame: true` (204 = nothing new yet). Concurrent claims receive
+distinct frames. Headers: X-Frame-ID, X-Session-ID, X-Captured-At, X-Received-At,
+X-Server-Time, X-Content-Box. It then POSTs `/v1/cameras/{id}/observations`.
+A result is accepted for any frame claimed in the current session that is newer
+than the last decision and within the 15-second freshness limit; a result older
+than an already-applied one is rejected (409). Event snapshots are the claimed
+frame's own JPEG. Old clients without `after` still get the latest frame.
+
+Person fields: track_id, associated_ppe (`{"class","confidence"}` preferred; bare
+strings are treated as already filtered), foot_point_norm [x,y] in 0..1 of the
+picture (or legacy pixel foot_point), ppe_reliable, face_touch (true/false/null),
+handwash_status. Zone and required PPE come from cloud_backend/config/camera_zones.yaml
+(see docs/ZONE_CALIBRATION.md). face_touch / handwash alerts are evaluated only
+with PPE_CHECK_ACTIONS=true; otherwise they are reported but not alerted.
 Measure model latency and adjust sampling/compute before changing this limit.
 
 The launcher `python -m cloud_backend.serve` starts the API and, if PPE_DETECTOR

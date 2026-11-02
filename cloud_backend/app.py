@@ -1,19 +1,21 @@
 """Run with: uvicorn cloud_backend.app:create_app --factory --workers 1."""
 from __future__ import annotations
 
-from collections import deque
+import asyncio
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from threading import RLock
-from typing import Annotated
+from typing import Annotated, Literal
 import hmac
 import json
 import os
 import sqlite3
+import time
 import uuid
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
@@ -22,6 +24,10 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator
 
 from ml_adapter import MLAdapter
+from cloud_backend.zone_policy import OUTSIDE, PPE_ITEMS, ZoneConfig, load_zone_config, normalize_point, select_ppe
+
+API_VERSION = '2026-11-02.latest-frame-zones'
+MAX_CLAIMS = 4
 
 
 @dataclass(frozen=True)
@@ -29,12 +35,16 @@ class Settings:
     api_key: str
     data_dir: Path
     cameras: tuple[str, ...] = ('CAM_01', 'CAM_02')
-    required_ppe: tuple[str, ...] = ('hairnet', 'mask', 'gloves')
     stale_seconds: int = 15
     voting_k: int = 3
     voting_n: int = 5
     recovery_frames: int = 3
     max_image_bytes: int = 2 * 1024 * 1024
+    zone_config: ZoneConfig = field(default_factory=load_zone_config)
+    check_actions: bool = False
+    min_confidence: float = 0.5
+    zone_confirm_frames: int = 2
+    max_claim_wait: float = 10.0
 
     def __post_init__(self):
         if len(self.api_key) < 32:
@@ -43,13 +53,25 @@ class Settings:
             raise ValueError('Configure unique camera IDs')
         if not 1 <= self.voting_k <= self.voting_n or self.recovery_frames < 1 or self.stale_seconds < 1:
             raise ValueError('Invalid temporal configuration')
+        if missing := [c for c in self.cameras if c not in self.zone_config.cameras]:
+            raise ValueError(f'No zone layout for {missing}; add them to the zone config')
+        if not 0 < self.min_confidence <= 1 or self.zone_confirm_frames < 1:
+            raise ValueError('Invalid confidence or zone confirmation setting')
 
     @classmethod
     def from_env(cls):
         return cls(api_key=os.environ.get('PPE_API_KEY', ''),
                    data_dir=Path(os.environ.get('PPE_DATA_DIR', 'cloud_data')),
                    cameras=tuple(c.strip() for c in os.environ.get('PPE_CAMERA_IDS', 'CAM_01,CAM_02').split(',') if c.strip()),
-                   stale_seconds=int(os.environ.get('PPE_STALE_SECONDS', '15')))
+                   stale_seconds=int(os.environ.get('PPE_STALE_SECONDS', '15')),
+                   zone_config=load_zone_config(),
+                   check_actions=os.environ.get('PPE_CHECK_ACTIONS', 'false').lower() == 'true',
+                   min_confidence=float(os.environ.get('PPE_MIN_CONFIDENCE', '0.5')))
+
+    @property
+    def required_ppe(self):
+        """Every PPE item some zone requires (kept for API compatibility)."""
+        return tuple(i for i in PPE_ITEMS if any(i in z.required_ppe for z in self.zone_config.zones.values()))
 
 
 class Detection(BaseModel):
@@ -60,6 +82,18 @@ class Detection(BaseModel):
 class Person(BaseModel):
     track_id: int = Field(ge=0)
     associated_ppe: list[str | Detection] = Field(default_factory=list, max_length=50)
+    # Normalised [0..1] foot point in the camera picture (preferred) or legacy pixels.
+    foot_point_norm: tuple[float, float] | None = None
+    foot_point: tuple[float, float] | None = None
+    # False when the person is too small/cut off for PPE evidence: items become unknown.
+    ppe_reliable: bool = True
+    face_touch: bool | None = None
+    handwash_status: Literal['not_at_station', 'waiting', 'washing', 'paused', 'completed',
+                             'incomplete', 'unknown'] | None = None
+    handwash_seconds: float | None = Field(default=None, ge=0, le=3600)
+    # Accepted from the earlier main-branch detector.
+    handwash_incomplete: bool | None = None
+    handwash_done: bool | None = None
 
     @field_validator('associated_ppe')
     @classmethod
@@ -86,8 +120,19 @@ class Ack(BaseModel):
     command_id: str = Field(min_length=1, max_length=64)
 
 
+def _parse_box(text, width, height):
+    try:
+        box = tuple(float(v) for v in text.split(','))
+    except ValueError:
+        raise HTTPException(422, 'content_box must be "left,top,right,bottom" pixels')
+    if len(box) != 4 or not (0 <= box[0] < box[2] <= width and 0 <= box[1] < box[3] <= height):
+        raise HTTPException(422, 'content_box must lie inside the image')
+    return box
+
+
 def create_app(settings: Settings | None = None, now=None) -> FastAPI:
     settings = settings or Settings.from_env()
+    zones = settings.zone_config
     now = now or (lambda: datetime.now(timezone.utc))
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(settings.data_dir / 'ppe_cloud.db', check_same_thread=False)
@@ -98,6 +143,8 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
         session_id TEXT NOT NULL, frame_id INTEGER NOT NULL, captured_at TEXT NOT NULL,
         recorded_at TEXT NOT NULL, track_id INTEGER NOT NULL, item TEXT NOT NULL,
         snapshot BLOB NOT NULL)''')
+    if 'zone' not in {r[1] for r in db.execute('PRAGMA table_info(events)')}:
+        db.execute('ALTER TABLE events ADD COLUMN zone TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS events_recorded ON events(recorded_at DESC)')
     db.execute('''CREATE TABLE IF NOT EXISTS device_state (
         device_id TEXT PRIMARY KEY, last_seen TEXT NOT NULL, acknowledged_command TEXT)''')
@@ -111,8 +158,8 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
         yield
         db.close()
 
-    app = FastAPI(title='PPE Cloud Backend', version='1.0.0', lifespan=lifespan,
-                  description='Phone JPEG upload → cloud detector result → persistent events → ESP32 polling. Unknown is never compliant.')
+    app = FastAPI(title='PPE Cloud Backend', version=API_VERSION, lifespan=lifespan,
+                  description='Phone JPEG upload → latest-frame claim by an external worker → zone rules → persistent events → ESP32 polling. Unknown is never compliant.')
 
     def auth(x_api_key: Annotated[str | None, Header()] = None):
         if x_api_key is None or not hmac.compare_digest(x_api_key, settings.api_key):
@@ -141,13 +188,28 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
                     captured_at=decision['captured_dt'].isoformat() if decision else None,
                     persons=[] if stale else decision['persons'],
                     active_violations=[] if stale else decision['active_violations'],
-                    decision_age_seconds=round(max(0, age(decision['captured_dt'])), 3) if decision else None)
+                    decision_age_seconds=round(max(0, age(decision['captured_dt'])), 3) if decision else None,
+                    actions_enforced=settings.check_actions,
+                    pipeline=dict(c.get('stats', {}),
+                                  capture_to_decision_ms=decision['latency_ms'] if decision else None,
+                                  latest_frame_age_ms=round(age(frame['captured_dt']) * 1000, 1) if frame else None))
 
-    def record(c, camera_id, track_id, item, kind):
-        f = c['frame']; event_id = str(uuid.uuid4())
-        db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)',
-                   (event_id, kind, camera_id, c['session_id'], f['frame_id'], f['captured_dt'].isoformat(), now().isoformat(), track_id, item, f['jpeg']))
+    def record(c, camera_id, track_id, item, kind, frame=None, zone=None):
+        f = frame or c.get('decision_frame') or {}
+        event_id = str(uuid.uuid4())
+        db.execute('INSERT INTO events(event_id,type,camera_id,session_id,frame_id,captured_at,recorded_at,track_id,item,snapshot,zone) '
+                   'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                   (event_id, kind, camera_id, c['session_id'], f.get('frame_id', -1),
+                    (f.get('captured_dt') or now()).isoformat(), now().isoformat(), track_id, item,
+                    f.get('jpeg', b'') if kind in ('VIOLATION', 'RECOVERY') else b'', zone))
         return event_id
+
+    def close_incidents(c, camera_id, track_id, t, kind):
+        """End open incidents without calling them a PPE recovery."""
+        for item, item_state in t['items'].items():
+            if item_state['active']:
+                record(c, camera_id, track_id, item, kind, zone=t.get('zone'))
+                item_state['active'] = None
 
     @app.get('/camera', response_class=HTMLResponse, include_in_schema=False)
     def camera_page():
@@ -155,26 +217,39 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
 
     @app.get('/camera-config', include_in_schema=False)
     def camera_config():
-        return {'cameras': settings.cameras}
+        stations = [p for c in settings.cameras for poly in zones.station_polygons(c) for p in poly]
+        xs = [p[0] for p in stations] or [0.5, 1]
+        ys = [p[1] for p in stations] or [0, 1]
+        return {'api_version': API_VERSION, 'cameras': settings.cameras, 'zone_config': zones.to_dict(),
+                'check_actions': settings.check_actions, 'stale_seconds': settings.stale_seconds,
+                'min_confidence': settings.min_confidence,
+                # Compatibility with the earlier main-branch worker/page.
+                'zone_mode': 'cameras', 'handwash_roi': [min(xs), min(ys), max(xs), max(ys)]}
 
     @app.get('/healthz')
     def health():
         with lock:
             db.execute('SELECT 1').fetchone()
-        return {'status': 'ok', 'service': 'ppe-cloud', 'inference': 'external-worker', 'time': now().isoformat()}
+        return {'status': 'ok', 'service': 'ppe-cloud', 'api_version': API_VERSION, 'inference': 'external-worker', 'time': now().isoformat()}
 
     @app.post('/v1/cameras/{camera_id}/sessions', dependencies=secured)
     def start_session(camera_id: str):
         with lock:
             c = camera(camera_id)
+            if c.get('session_id'):
+                for tid, t in c.get('tracks', {}).items():
+                    close_incidents(c, camera_id, tid, t, 'SESSION_RESET')
+                db.commit()
             c.clear()
-            c.update(session_id=str(uuid.uuid4()), adapter=MLAdapter(hold_frames=0), tracks={})
+            c.update(session_id=str(uuid.uuid4()), adapter=MLAdapter(hold_frames=0), tracks={}, claims=OrderedDict(),
+                     stats={'uploads': 0, 'superseded_before_claim': 0, 'claims': 0, 'decisions': 0, 'rejected_results': 0})
             return {'camera_id': camera_id, 'session_id': c['session_id'], 'next_frame_id': 0}
 
     @app.post('/v1/cameras/{camera_id}/frames', dependencies=secured, status_code=201)
     async def frame_upload(camera_id: str, session_id: Annotated[uuid.UUID, Form()],
                            frame_id: Annotated[int, Form(ge=0)], captured_at: Annotated[datetime, Form()],
-                           image: Annotated[UploadFile, File()]):
+                           image: Annotated[UploadFile, File()],
+                           content_box: Annotated[str | None, Form(max_length=80)] = None):
         if captured_at.tzinfo is None:
             raise HTTPException(422, 'captured_at must include UTC offset, for example +00:00')
         data = await image.read(settings.max_image_bytes + 1)
@@ -185,24 +260,29 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
             with Image.open(BytesIO(data)) as im:
                 if im.format != 'JPEG' or im.width * im.height > 1920 * 1080:
                     raise HTTPException(422, 'Use a JPEG of at most 1920 × 1080 pixels')
+                size = im.size
                 im.verify()
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
             raise HTTPException(422, 'Invalid JPEG')
+        box = _parse_box(content_box, *size) if content_box else (0, 0, *size)
         with lock:
             c = camera(camera_id)
             if str(session_id) != c.get('session_id'):
                 raise HTTPException(409, 'Session expired; start a new camera session')
             if not -5 <= age(captured_at) <= settings.stale_seconds:
                 raise HTTPException(422, 'Frame timestamp is stale or too far in the future; sync camera clock')
-            if frame_id <= c.get('frame', {}).get('frame_id', -1):
-                raise HTTPException(409, 'Duplicate or out-of-order frame')
-            claimed = c.get('claimed_at')
-            if claimed and age(claimed) < min(10, settings.stale_seconds):
-                raise HTTPException(429, 'Detector is processing this camera; drop this frame and retry later', headers={'Retry-After': '1'})
-            # One latest frame per camera: no unbounded queue or old-frame backlog.
-            c['frame'] = dict(frame_id=frame_id, captured_dt=captured_at, received_dt=now(), jpeg=data)
+            previous = c.get('frame')
+            if frame_id <= (previous or {}).get('frame_id', -1):
+                raise HTTPException(409, 'Duplicate or out-of-order frame; dropped')
+            # Single latest-frame slot: a newer upload always replaces an unclaimed one,
+            # so there is never a backlog and the phone is never blocked by inference.
+            if previous and not previous.get('claimed'):
+                c['stats']['superseded_before_claim'] += 1
+            c['stats']['uploads'] += 1
+            c['frame'] = dict(frame_id=frame_id, captured_dt=captured_at, received_dt=now(), jpeg=data,
+                              size=size, content_box=box, claimed=False)
             return {'camera_id': camera_id, 'session_id': str(session_id), 'frame_id': frame_id,
-                    'status': 'AWAITING_INFERENCE'}
+                    'status': 'LATEST_AWAITING_INFERENCE'}
 
     @app.get('/v1/cameras', dependencies=secured)
     def list_cameras():
@@ -216,83 +296,167 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
             return state(camera_id)
 
     @app.get('/v1/cameras/{camera_id}/frame', dependencies=secured)
-    def latest_frame(camera_id: str, x_claim_frame: Annotated[bool, Header()] = False):
-        with lock:
-            c = camera(camera_id); f = c.get('frame')
-            if not f:
-                raise HTTPException(404, 'No frame available')
-            if age(f['captured_dt']) > settings.stale_seconds:
-                raise HTTPException(410, 'Latest frame has expired')
-            if x_claim_frame:
-                c['claimed_at'] = now()
-            return Response(f['jpeg'], media_type='image/jpeg', headers={
-                'X-Frame-ID': str(f['frame_id']), 'X-Session-ID': c['session_id'],
-                'X-Captured-At': f['captured_dt'].isoformat(), 'Cache-Control': 'no-store'})
+    async def latest_frame(camera_id: str, x_claim_frame: Annotated[bool, Header()] = False,
+                           after: Annotated[int | None, Query(ge=-1)] = None,
+                           session: Annotated[str | None, Query(max_length=64)] = None,
+                           wait: Annotated[float, Query(ge=0)] = 0):
+        """Latest frame. With after/wait this long-polls for a frame newer than `after`
+        (within `session`), removing the worker's polling round-trip and idle gaps.
+        Concurrent long-poll claims never receive the same frame."""
+        deadline = time.monotonic() + min(wait, settings.max_claim_wait)
+        while True:
+            with lock:
+                c = camera(camera_id); f = c.get('frame')
+                newer = f is not None and (after is None or session != c.get('session_id') or f['frame_id'] > after)
+                if newer and after is not None and x_claim_frame and f.get('claimed'):
+                    newer = False  # another fetcher holds it; wait for the next upload
+                if newer and age(f['captured_dt']) <= settings.stale_seconds:
+                    if x_claim_frame:
+                        f['claimed'] = True
+                        claims = c['claims']
+                        claims[f['frame_id']] = f
+                        while len(claims) > MAX_CLAIMS:
+                            claims.popitem(last=False)
+                        c['stats']['claims'] += 1
+                    l, t, r, b = f['content_box']
+                    return Response(f['jpeg'], media_type='image/jpeg', headers={
+                        'X-Frame-ID': str(f['frame_id']), 'X-Session-ID': c['session_id'],
+                        'X-Captured-At': f['captured_dt'].isoformat(), 'X-Received-At': f['received_dt'].isoformat(),
+                        'X-Server-Time': now().isoformat(), 'X-Content-Box': f'{l:g},{t:g},{r:g},{b:g}',
+                        'Cache-Control': 'no-store'})
+                if time.monotonic() >= deadline:
+                    if after is not None and wait:
+                        return Response(status_code=204, headers={'Cache-Control': 'no-store'})
+                    if not f:
+                        raise HTTPException(404, 'No frame available')
+                    if newer:
+                        raise HTTPException(410, 'Latest frame has expired')
+                    raise HTTPException(404, 'No new frame available')
+            await asyncio.sleep(0.02)
+
+    def evaluate(c, camera_id, person, frame):
+        """Zone, required items and action checks for one tracked person."""
+        point = person.foot_point_norm
+        if point is None and person.foot_point is not None:
+            point = normalize_point(*person.foot_point, *frame['size'], frame['content_box'])
+        candidate = zones.zone_for(camera_id, point)
+        t = c['tracks'].setdefault(person.track_id, {'last_seen': now(), 'items': {}, 'zone': None, 'pending': None, 'pending_n': 0})
+        t['last_seen'] = now()
+        if candidate == OUTSIDE:
+            return OUTSIDE, {}
+        if t['zone'] is None:
+            t['zone'] = candidate
+        elif candidate != t['zone']:
+            # Hysteresis: one frame of foot-point jitter at a boundary is not a zone change.
+            t['pending_n'] = t['pending_n'] + 1 if t['pending'] == candidate else 1
+            t['pending'] = candidate
+            if t['pending_n'] >= settings.zone_confirm_frames:
+                close_incidents(c, camera_id, person.track_id, t, 'ZONE_EXIT')
+                t.update(items={}, zone=candidate, pending=None, pending_n=0)
+        else:
+            t.update(pending=None, pending_n=0)
+        zone = t['zone']
+        rules = zones.rules(zone)
+        detections = [d if isinstance(d, str) else {'class': d.class_name, 'confidence': d.confidence}
+                      for d in person.associated_ppe]
+        scored = select_ppe([d for d in detections if isinstance(d, dict)], settings.min_confidence)
+        # Bare strings come from older detectors that filtered before sending.
+        ppe = c['adapter'].update(person.track_id, scored + [d for d in detections if isinstance(d, str)], frame['frame_id'])
+        evaluated = {i: (ppe[i] if person.ppe_reliable else 'not_detected') for i in rules.required_ppe}
+        if settings.check_actions:
+            if 'face_touch' in rules.action_checks and person.face_touch is not None:
+                evaluated['face_touch'] = 'missing' if person.face_touch else 'present'
+            if 'handwash_incomplete' in rules.action_checks:
+                if person.handwash_status == 'incomplete' or person.handwash_incomplete:
+                    evaluated['handwash'] = 'missing'
+                elif person.handwash_status == 'completed' or person.handwash_done:
+                    evaluated['handwash'] = 'present'
+        return zone, evaluated
 
     @app.post('/v1/cameras/{camera_id}/observations', dependencies=secured)
     def observations(camera_id: str, observation: Observation):
         with lock:
-            c = camera(camera_id); f = c.get('frame')
-            if not f or str(observation.session_id) != c.get('session_id') or observation.frame_id != f['frame_id']:
-                raise HTTPException(409, 'Result must match the latest camera session and frame')
+            c = camera(camera_id)
+            if str(observation.session_id) != c.get('session_id'):
+                raise HTTPException(409, 'Result belongs to an old camera session')
+            latest = c.get('frame')
+            f = c['claims'].get(observation.frame_id) or (latest if latest and latest['frame_id'] == observation.frame_id else None)
+            if f is None:
+                c['stats']['rejected_results'] += 1
+                raise HTTPException(409, 'Result does not match a frame issued for this session')
             if observation.frame_id <= c.get('decision', {}).get('frame_id', -1):
-                raise HTTPException(409, 'This frame result was already processed')
+                c['stats']['rejected_results'] += 1
+                raise HTTPException(409, 'A newer or identical frame result was already processed')
             if age(f['captured_dt']) > settings.stale_seconds:
+                c['stats']['rejected_results'] += 1
                 raise HTTPException(409, 'Inference result expired')
-            adapter = c['adapter']; tracks = c['tracks']; rows = []
+            tracks = c['tracks']; adapter = c['adapter']; rows = []
+            c['decision_frame'] = f
             # An expired identity is forgotten; stale history must not vote on a new person.
             for tid in list(tracks):
                 if age(tracks[tid]['last_seen']) > settings.stale_seconds:
+                    close_incidents(c, camera_id, tid, tracks[tid], 'TRACK_LOST')
                     del tracks[tid]
                     adapter.last_state.pop(tid, None); adapter.missing_frames.pop(tid, None); adapter.last_seen.pop(tid, None)
             for person in observation.persons:
-                detections = [d if isinstance(d, str) else {'class': d.class_name}
-                              for d in person.associated_ppe if isinstance(d, str) or d.confidence >= .5]
-                ppe = adapter.update(person.track_id, detections, observation.frame_id)
-                t = tracks.setdefault(person.track_id, {'last_seen': now(), 'items': {}})
-                t['last_seen'] = now()
-                for item in settings.required_ppe:
-                    v = ppe[item]
+                zone, evaluated = evaluate(c, camera_id, person, f)
+                t = tracks[person.track_id]
+                for item, v in evaluated.items():
                     item_state = t['items'].setdefault(item, {'votes': deque(maxlen=settings.voting_n), 'clear': 0, 'active': None})
                     item_state['votes'].append(v == 'missing' if v != 'not_detected' else None)
                     item_state['clear'] = item_state['clear'] + 1 if v == 'present' else 0
                     # Only a currently explicit absence can confirm a violation.
                     if v == 'missing' and sum(x is True for x in item_state['votes']) >= settings.voting_k and not item_state['active']:
-                        item_state['active'] = record(c, camera_id, person.track_id, item, 'VIOLATION')
+                        item_state['active'] = record(c, camera_id, person.track_id, item, 'VIOLATION', f, zone)
                     if item_state['active'] and item_state['clear'] >= settings.recovery_frames:
-                        record(c, camera_id, person.track_id, item, 'RECOVERY')
+                        record(c, camera_id, person.track_id, item, 'RECOVERY', f, zone)
                         item_state['active'] = None
                         item_state['votes'].clear()
-                rows.append({'track_id': person.track_id, 'ppe': {i: ppe[i] for i in settings.required_ppe}})
-            active = [{'track_id': tid, 'item': item, 'event_id': v['active']}
+                last = adapter.last_state.get(person.track_id, {})
+                rows.append({'track_id': person.track_id, 'zone': zone,
+                             'required': list(zones.rules(zone).required_ppe) if zone != OUTSIDE else [],
+                             'evaluated': evaluated, 'ppe': {i: last.get(i, 'not_detected') for i in PPE_ITEMS},
+                             'ppe_reliable': person.ppe_reliable, 'face_touch': person.face_touch,
+                             'handwash_status': person.handwash_status, 'handwash_seconds': person.handwash_seconds})
+            active = [{'track_id': tid, 'item': item, 'event_id': v['active'], 'zone': t.get('zone')}
                       for tid, t in tracks.items() for item, v in t['items'].items() if v['active']]
+            values = [v for p in rows for v in p['evaluated'].values()]
             if active:
                 status = 'VIOLATION'
             elif not rows:
                 status = 'NO_PERSON'
-            elif any(v == 'not_detected' for p in rows for v in p['ppe'].values()):
+            elif any(p['zone'] == OUTSIDE for p in rows) or 'not_detected' in values:
                 status = 'UNKNOWN'
-            elif any(v == 'missing' for p in rows for v in p['ppe'].values()):
+            elif 'missing' in values:
                 status = 'PENDING'
-            else:
+            elif any(p['required'] for p in rows):
                 status = 'COMPLIANT'
+            else:
+                # No PPE requirement applies here: observed, not verified compliant.
+                status = 'MONITORING'
             c['decision'] = dict(status=status, frame_id=observation.frame_id, captured_dt=f['captured_dt'],
-                                 received_dt=now(), persons=rows, active_violations=active)
-            c.pop('claimed_at', None)
+                                 received_dt=now(), persons=rows, active_violations=active,
+                                 latency_ms=round(age(f['captured_dt']) * 1000, 1))
+            for old in [k for k in c['claims'] if k <= observation.frame_id]:
+                del c['claims'][old]
+            c['stats']['decisions'] += 1
             db.commit()
             return state(camera_id)
 
     def device_command(device_id):
         if device_id != 'ESP32_01':
             raise HTTPException(404, 'Device is not configured')
-        states = [state(c) for c in cameras]
+        # Pipeline statistics are for operators, not the ESP32: keep its JSON payload small.
+        states = [{k: v for k, v in state(c).items() if k not in ('pipeline', 'actions_enforced')} for c in cameras]
         alert = any(c['status'] == 'VIOLATION' for c in states)
-        compliant = all(c['status'] == 'COMPLIANT' for c in states)
+        # Green needs every camera fresh and non-violating, and at least one verified
+        # PPE-compliant view. Unknown, pending or disconnected cameras never give green.
+        compliant = (all(c['status'] in ('COMPLIANT', 'MONITORING', 'NO_PERSON') for c in states)
+                     and any(c['status'] == 'COMPLIANT' for c in states))
         overall = 'VIOLATION' if alert else 'COMPLIANT' if compliant else 'UNKNOWN'
         # Include incident IDs so a later, identical-looking violation is a new command.
         identity = [(c['camera_id'], c['session_id'], c['status'], c['active_violations']) for c in states]
         command_id = sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
-        row = db.execute('SELECT acknowledged_command FROM device_state WHERE device_id=?', (device_id,)).fetchone()
         acknowledged = {r[0] for r in db.execute('SELECT event_id FROM acknowledged_incidents WHERE device_id=?', (device_id,))}
         active_ids = {v['event_id'] for c in states for v in c['active_violations']}
         return dict(command_id=command_id, device_id=device_id, status=overall, alert=alert,
@@ -336,7 +500,7 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
         with lock:
             if camera_id is not None:
                 camera(camera_id)
-            sql = 'SELECT event_id,type,camera_id,session_id,frame_id,captured_at,recorded_at,track_id,item FROM events'
+            sql = 'SELECT event_id,type,camera_id,session_id,frame_id,captured_at,recorded_at,track_id,item,zone,length(snapshot) AS snapshot_bytes FROM events'
             args = []
             if camera_id:
                 sql += ' WHERE camera_id=?'; args.append(camera_id)
@@ -344,7 +508,7 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
             result = []
             for row in db.execute(sql, (*args, limit, offset)).fetchall():
                 value = dict(row); value['missing_items'] = [value.pop('item')]
-                value['snapshot_url'] = f"/v1/events/{value['event_id']}/snapshot"
+                value['snapshot_url'] = f"/v1/events/{value['event_id']}/snapshot" if value.pop('snapshot_bytes') else None
                 result.append(value)
             return {'events': result, 'limit': limit, 'offset': offset}
 
@@ -352,8 +516,8 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
     def snapshot(event_id: uuid.UUID):
         with lock:
             row = db.execute('SELECT snapshot FROM events WHERE event_id=?', (str(event_id),)).fetchone()
-            if not row:
-                raise HTTPException(404, 'Event not found')
+            if not row or not row['snapshot']:
+                raise HTTPException(404, 'Event not found or has no snapshot')
             return Response(row['snapshot'], media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
 
     return app

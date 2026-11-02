@@ -5,17 +5,21 @@ import pytest
 from PIL import Image
 from fastapi.testclient import TestClient
 from cloud_backend.app import create_app, Settings
+from cloud_backend.zone_policy import ZoneConfig
 
 KEY='test-key-with-at-least-thirty-two-characters'
 HEADERS={'X-API-Key': KEY}
+# Generic API-contract tests: every camera is a production view requiring all PPE.
+ALL_PRODUCTION=ZoneConfig.from_dict({'cameras':{c:{'default_zone':'production'} for c in ('CAM_01','CAM_02')},
+                                     'zones':{'production':{'required_ppe':['hairnet','mask','gloves']}}})
 
-def jpeg():
-    out=BytesIO(); Image.new('RGB',(64,64),'gray').save(out,format='JPEG'); return out.getvalue()
+def jpeg(colour='gray',size=(64,64)):
+    out=BytesIO(); Image.new('RGB',size,colour).save(out,format='JPEG'); return out.getvalue()
 
 @pytest.fixture
 def setup(tmp_path):
     clock=[datetime.now(timezone.utc)]
-    settings=Settings(api_key=KEY, data_dir=tmp_path, stale_seconds=15)
+    settings=Settings(api_key=KEY, data_dir=tmp_path, stale_seconds=15, zone_config=ALL_PRODUCTION)
     with TestClient(create_app(settings, now=lambda:clock[0])) as client:
         yield client, clock, settings
 
@@ -125,13 +129,22 @@ def test_acknowledged_incident_does_not_buzz_again_when_other_camera_changes(set
     assert command(c)['buzzer'] is False
 
 
-def test_worker_claim_provides_backpressure(setup):
-    c,clock,_=setup; s=session(c); upload(c,clock,s,1)
-    frame=c.get('/v1/cameras/CAM_01/frame',headers={**HEADERS,'X-Claim-Frame':'true'})
-    assert frame.status_code==200
-    assert upload(c,clock,s,2).status_code==429
-    assert observation(c,s,1,PRESENT).status_code==200
-    assert upload(c,clock,s,2).status_code==201
+def test_claimed_frame_never_blocks_uploads_and_keeps_its_own_snapshot(setup):
+    c,clock,_=setup; s=session(c)
+    for n in (1,3,5):
+        assert upload(c,clock,s,n,data=jpeg('red')).status_code==201
+        frame=c.get('/v1/cameras/CAM_01/frame',headers={**HEADERS,'X-Claim-Frame':'true'})
+        assert frame.headers['X-Frame-ID']==str(n)
+        # Latest-frame slot: the phone is never told to back off while inference runs.
+        assert upload(c,clock,s,n+1,data=jpeg('blue')).status_code==201
+        assert observation(c,s,n,MISSING).status_code==200
+    assert observation(c,s,5,MISSING).status_code==409  # already decided
+    events=c.get('/v1/events',headers=HEADERS).json()['events']
+    assert [e['type'] for e in events]==['VIOLATION'] and events[0]['frame_id']==5
+    # Evidence is the frame that was analysed, not the newer one that replaced it.
+    assert c.get(events[0]['snapshot_url'],headers=HEADERS).content==jpeg('red')
+    pipe=c.get('/v1/cameras/CAM_01',headers=HEADERS).json()['pipeline']
+    assert pipe['uploads']==6 and pipe['superseded_before_claim']==2 and pipe['decisions']==3
 
 
 def test_new_incident_after_recovery_can_buzz_again(setup):

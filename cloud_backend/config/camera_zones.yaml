@@ -1,0 +1,36 @@
+# Camera / zone layout used by the backend rules, the Mac worker and the monitor.
+# The worker downloads this from GET /camera-config at start-up, so the backend is
+# the single source of truth. Edit, redeploy, then restart the worker.
+#
+# Coordinates are NORMALISED to the camera picture itself: x=0 left edge, x=1 right
+# edge, y=0 top, y=1 bottom. They do not depend on upload resolution or orientation
+# and exclude any letterbox bars. A person's zone is decided by the bottom-centre of
+# their box (the "foot point"). Regions are tested in order; the first match wins;
+# otherwise the camera's default_zone applies. See docs/ZONE_CALIBRATION.md.
+
+cameras:
+  CAM_01:                      # corridor / gowning camera
+    default_zone: corridor
+    regions:
+      - zone: handwash         # sink area inside CAM_01's view - CALIBRATE on site
+        polygon: [[0.50, 0.00], [1.00, 0.00], [1.00, 1.00], [0.50, 1.00]]
+  CAM_02:                      # separate production camera; whole view is production
+    default_zone: production
+    regions: []
+
+zones:
+  corridor:
+    required_ppe: []           # gowning happens here; PPE is not yet required
+    action_checks: [handwash_incomplete]
+  handwash:
+    required_ppe: []           # UNCLEAR POLICY: confirm whether PPE is required at the sink
+    action_checks: [handwash_incomplete]
+    handwash_station: true
+  production:
+    required_ppe: [hairnet, mask, gloves]
+    action_checks: [face_touch]
+
+handwash:
+  required_seconds: 20         # observed active washing, not time since first motion
+  max_gap_seconds: 1.0         # a longer gap between evidence samples is not counted
+  forget_after_seconds: 15     # a track unseen this long starts again from zero

@@ -53,7 +53,9 @@ def test_detector_reuses_pose_and_keeps_camera_trackers_separate(monkeypatch,tmp
         def __init__(self,**kwargs):pass
         def process(self,image):calls.append(image.shape);return types.SimpleNamespace(pose_landmarks=None)
     monkeypatch.setitem(sys.modules,'ultralytics',types.SimpleNamespace(YOLO=Model))
-    monkeypatch.setitem(sys.modules,'mediapipe',types.SimpleNamespace(solutions=types.SimpleNamespace(pose=types.SimpleNamespace(Pose=Pose))))
+    import enum
+    Landmark=enum.IntEnum('PoseLandmark',{n:i for i,n in enumerate(['NOSE','LEFT_SHOULDER','RIGHT_SHOULDER','LEFT_WRIST','RIGHT_WRIST'])})
+    monkeypatch.setitem(sys.modules,'mediapipe',types.SimpleNamespace(solutions=types.SimpleNamespace(pose=types.SimpleNamespace(Pose=Pose,PoseLandmark=Landmark))))
     monkeypatch.setitem(sys.modules,'torch',types.SimpleNamespace())
     monkeypatch.setenv('PPE_DEVICE','cpu');monkeypatch.setenv('PPE_MONITOR_DIR',str(tmp_path))
     spec=importlib.util.spec_from_file_location('detector_under_test',Path('ai_detector.py'))

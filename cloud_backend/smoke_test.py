@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--url',default='http://127.0.0.1:8000')
-    p.add_argument('--camera',default='CAM_01')
+    p.add_argument('--camera',default='CAM_02',help='A camera whose zone requires PPE (CAM_02 production by default)')
     p.add_argument('--confirm-test',action='store_true',help='Starts a new session on this camera; stops its current upload session')
     args=p.parse_args()
     if not args.confirm_test:
