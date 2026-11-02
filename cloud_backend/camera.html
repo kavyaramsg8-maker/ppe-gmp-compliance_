@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="ppe-page-version" content="2026-11-02.2">
+<meta name="ppe-page-version" content="2026-11-02.3">
 <title>PPE Camera Upload</title><style>
 body{font:16px system-ui;margin:0;background:#101722;color:#edf2f9}main{max-width:700px;margin:auto;padding:24px}h1{font-size:26px}p{color:#b7c4d5;line-height:1.5}label{display:block;margin:15px 0 6px}input,select,button{font:inherit;padding:12px;border:1px solid #475569;border-radius:7px;background:#1e293b;color:white;box-sizing:border-box}input,select{width:100%}button{cursor:pointer;margin:16px 8px 12px 0;background:#176857}button:disabled{opacity:.5;cursor:default}video{width:100%;border-radius:8px;background:black}pre{white-space:pre-wrap;padding:16px;border-radius:8px;background:#1e293b}small{color:#b7c4d5}
 </style><main><h1>PPE camera connection</h1><p>This page sends sampled JPEG frames directly from this phone to the cloud backend. It does not run detection on the phone.</p>
@@ -9,11 +9,12 @@ body{font:16px system-ui;margin:0;background:#101722;color:#edf2f9}main{max-widt
 <label for="token">Shared API key</label><input id="token" type="password" autocomplete="off" placeholder="Enter the team API key">
 <button id="start">Start camera</button><button id="stop" disabled>Stop</button>
 <video id="video" playsinline muted autoplay></video><canvas id="canvas" hidden></canvas>
-<pre id="status" aria-live="polite">Stopped. Camera permission and HTTPS are required.</pre><small>Page version 2026-11-02.2. Use one phone per camera ID and keep it fixed in the orientation used for zone calibration. The key stays in page memory and is not saved in browser storage.</small></main>
+<pre id="status" aria-live="polite">Stopped. Camera permission and HTTPS are required.</pre><small>Page version 2026-11-02.3. Use one phone per camera ID and keep it fixed in the orientation used for zone calibration. The key stays in page memory and is not saved in browser storage.</small></main>
 <script>
 const el=id=>document.getElementById(id);
 const MAX_SIDE=640,MAX_IN_FLIGHT=2,TIMEOUT_MS=8000;
 let stream=null,running=false,session=null,frame=0,timer=null,statusTimer=null,statusBusy=false,restarting=false,wakeLock=null,decision='-';
+let clockOffset=0;
 let c={sent:0,accepted:0,skipped:0,dropped:0,busy:0,netErr:0},inFlight=new Set(),rtts=[],startedAt=0;
 const headers=()=>({'X-API-Key':el('token').value});
 const camPath=()=>'/v1/cameras/'+encodeURIComponent(el('camera').value);
@@ -21,10 +22,11 @@ fetch('/camera-config').then(r=>r.json()).then(d=>{
  el('zones').textContent=d.api_version?'Backend '+d.api_version+'. Zones are configured per camera on the server (CAM_01 corridor with handwash area, CAM_02 production).':'Old backend version without per-camera zone configuration.';
  d.cameras.forEach(id=>{let o=document.createElement('option');o.value=id;o.textContent=id;el('camera').append(o);});
 }).catch(()=>el('status').textContent='Cannot load camera configuration.');
+async function syncClock(){let best=null;for(let i=0;i<4;i++){try{let t0=Date.now(),r=await fetch('/healthz',{cache:'no-store'}),t1=Date.now(),d=await r.json();let off=Date.parse(d.time)-(t0+t1)/2;if(!best||t1-t0<best.rtt)best={rtt:t1-t0,off};}catch(e){}}if(best)clockOffset=Math.round(best.off);}
 async function postSession(){let r=await fetch(camPath()+'/sessions',{method:'POST',headers:headers()});if(!r.ok)throw Error('Session failed: '+r.status);session=(await r.json()).session_id;frame=0;}
 function median(a){if(!a.length)return null;let s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)];}
 function show(){let secs=Math.max(1,(Date.now()-startedAt)/1000);
- el('status').textContent=`Uploads accepted: ${(c.accepted/secs).toFixed(1)}/s (target ${el('fps').value}/s)\nIn flight: ${inFlight.size}  skipped (network busy): ${c.skipped}  rejected old: ${c.dropped}  errors: ${c.netErr}${c.busy?'  busy(429): '+c.busy:''}\nUpload time p50: ${median(rtts)??'-'} ms\nBackend decision: ${decision}`;}
+ el('status').textContent=`Uploads accepted: ${(c.accepted/secs).toFixed(1)}/s (target ${el('fps').value}/s)\nIn flight: ${inFlight.size}  skipped (network busy): ${c.skipped}  rejected old: ${c.dropped}  errors: ${c.netErr}${c.busy?'  busy(429): '+c.busy:''}\nUpload time p50: ${median(rtts)??'-'} ms  clock offset corrected: ${clockOffset} ms\nBackend decision: ${decision}`;}
 async function pollStatus(){if(!running||statusBusy)return;statusBusy=true;
  try{let s=await fetch(camPath(),{headers:headers()});if(s.ok){let d=await s.json();decision=`${d.status} | processed frame ${d.processed_frame_id} of ${d.latest_frame_id}${d.stale?' | STALE':''}`;}}catch(e){}finally{statusBusy=false;show();}}
 async function restartSession(){if(restarting)return;restarting=true;try{await postSession();}catch(e){c.netErr++;}finally{restarting=false;}}
@@ -50,7 +52,8 @@ function tick(){if(!running)return;
  // Native aspect ratio, no letterbox bars: zones are calibrated on the real picture.
  let s=Math.min(1,MAX_SIDE/Math.max(v.videoWidth,v.videoHeight)),cv=el('canvas');
  cv.width=Math.round(v.videoWidth*s);cv.height=Math.round(v.videoHeight*s);
- let captured=new Date().toISOString();cv.getContext('2d').drawImage(v,0,0,cv.width,cv.height);
+ // Server-clock capture time, so freshness checks do not depend on the phone clock.
+ let captured=new Date(Date.now()+clockOffset).toISOString();cv.getContext('2d').drawImage(v,0,0,cv.width,cv.height);
  let id=frame++,sid=session;
  cv.toBlob(b=>{if(b&&running)upload(b,id,sid,captured);},'image/jpeg',.75);
 }
@@ -61,7 +64,7 @@ function stop(){running=false;clearTimeout(timer);clearInterval(statusTimer);inF
 el('stop').onclick=stop;
 el('start').onclick=async()=>{try{
  if(!navigator.mediaDevices?.getUserMedia)throw Error('Open the HTTPS cloud address. Camera access is unavailable on this origin.');
- el('start').disabled=true;await postSession();
+ el('start').disabled=true;await syncClock();await postSession();
  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:640},height:{ideal:480}},audio:false});
  el('video').srcObject=stream;await el('video').play();
  try{wakeLock=await navigator.wakeLock?.request('screen');}catch(e){}

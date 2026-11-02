@@ -24,7 +24,7 @@ result interval p50 ≈1.5 s, p95 ≈2.3 s, CV 0.33; detector only **≈70–77 
 |---|---|---|
 | Freshness | Latest-frame slot. Uploads are never blocked (no 429); a newer upload replaces an unclaimed one and is counted. Long-poll claim `GET …/frame?after=&session=&wait=` (204 if nothing new). Concurrent claims get distinct frames. A result is accepted for any claimed frame newer than the last decision and <15 s old; older or superseded results get 409. Snapshots are the **claimed** frame's own JPEG | `cloud_backend/app.py` |
 | Worker | Per camera: 2 fetch threads, 1 inference thread, 2 submit threads, own HTTP connections. Shared models behind a FIFO gate (no camera starves). Latest-only hand-offs with drop counters. Out-of-order frames are skipped, never fed to the tracker backwards. Timeouts with back-off, rate-limited warnings, fatal on a bad key. Falls back to the old polling loop automatically against an old backend | `cloud_backend/worker.py` |
-| Phone page | Rate selector 3/5/8. Fixed capture clock with ≤2 uploads in flight (skips and counts when busy, never queues). Native aspect ratio, longest side 640, no letterbox. New session only when *this* session expired. Screen wake lock; stops if backgrounded. Visible page version `2026-11-02.2` | `cloud_backend/camera.html` |
+| Phone page | Rate selector 3/5/8. Fixed capture clock with ≤2 uploads in flight (skips and counts when busy, never queues). Native aspect ratio, longest side 640, no letterbox. New session only when *this* session expired. Screen wake lock; stops if backgrounded. Visible page version `2026-11-02.3` | `cloud_backend/camera.html` |
 | Monitor | Shows only processed frames, each tied to its frame ID and capture time by JPEG hash. Aspect ratio kept. Shows processed FPS, gap p95, capture→screen age, backend verdict and its frame. Dims with "NO FRESH PROCESSED FRAMES – UNKNOWN" after 15 s. Optional playout buffer (`--playout auto`) re-times **real** frames to capture cadence and **states the added delay**; it never interpolates or replays frames | `monitor.py` |
 | Zones | Per-camera normalised polygons and per-zone `required_ppe` / `action_checks` in one YAML. The backend derives zones (with 2-frame hysteresis) and serves the layout to the worker | `cloud_backend/zone_policy.py`, `cloud_backend/config/camera_zones.yaml`, `docs/ZONE_CALIBRATION.md`, `calibrate_zones.py` |
 | PPE evidence | Scored detections, 0.5 decision threshold. A close positive/negative conflict → unknown. One owner per box, head-band plausibility, too-small person → unknown. See `performance/MODEL_EVALUATION.md` | `ai_detector.py` |
@@ -86,7 +86,7 @@ both phones.
    curl -s https://ppe-gmp-compliance.onrender.com/healthz            # api_version 2026-11-02.latest-frame-zones
    curl -s https://ppe-gmp-compliance.onrender.com/camera | grep -o 'ppe-page-version" content="[^"]*'
    ```
-   On each phone, reload `/camera`; the footer must say **Page version 2026-11-02.2**.
+   On each phone, reload `/camera`; the footer must say **Page version 2026-11-02.3**.
 5. **Storage:** without a persistent disk (paid) mounted at `PPE_DATA_DIR=/var/data`, Render's filesystem
    is ephemeral. Events and snapshots are **lost on every redeploy, restart or free-tier spin-down**. Live
    state is always in memory; after any restart all cameras are UNKNOWN until fresh results arrive (tested).
