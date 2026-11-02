@@ -188,6 +188,13 @@ def load_zone_config(path=None):
             for region in camera.get('regions') or ():
                 if (data['zones'].get(region['zone']) or {}).get('handwash_station'):
                     region['polygon'] = [[left, top], [right, top], [right, bottom], [left, bottom]]
+    polygon = os.environ.get('PPE_HANDWASH_POLYGON')
+    if polygon:
+        # Calibrated sink polygon (normalised [[x, y], ...]); validated by from_dict.
+        for camera in data['cameras'].values():
+            for region in camera.get('regions') or ():
+                if (data['zones'].get(region['zone']) or {}).get('handwash_station'):
+                    region['polygon'] = json.loads(polygon)
     return ZoneConfig.from_dict(data)
 
 

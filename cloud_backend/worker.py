@@ -15,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import threading
 import time
 import httpx
@@ -320,6 +321,10 @@ def process_once(client, detector, executor=None, recorder=None):
     return count
 
 
+def _terminate(*_):
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', default=os.environ.get('PPE_BACKEND_URL', 'http://127.0.0.1:8000'))
@@ -330,6 +335,7 @@ def main():
     parser.add_argument('--connections', type=int, choices=[1, 2, 3], default=2, help='Concurrent fetches and submits per camera')
     parser.add_argument('--legacy-poll', action='store_true', help='Use the old list/claim polling loop')
     args = parser.parse_args(); key = os.environ.get('PPE_API_KEY')
+    signal.signal(signal.SIGTERM, _terminate)  # background start/stop scripts use SIGTERM
     if not key or not args.detector or ':' not in args.detector:
         parser.error('Set PPE_API_KEY and --detector module:function')
     module_name, function = args.detector.split(':', 1)

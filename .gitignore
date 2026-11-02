@@ -6,4 +6,5 @@ cloud_data/
 live_*.jpg
 *.db
 *.db-shm
-*.db-wal
+*.db-walbackups/
+performance_run/

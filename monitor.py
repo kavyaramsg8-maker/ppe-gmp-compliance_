@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import signal
 import statistics
 import time
 
@@ -154,17 +155,23 @@ def summary(feeds):
     out = {}
     for f in feeds:
         times = [t for t, _ in f.shown_log]
-        gaps = [(b - a) * 1000 for a, b in zip(times, times[1:])]
+        all_gaps = [(b - a) * 1000 for a, b in zip(times, times[1:])]
+        # Gaps over 2 s are outages (camera stopped/stale), reported separately from steadiness.
+        gaps = [g for g in all_gaps if g <= 2000]
         arrivals = list(f.arrivals)
         a_gaps = [(b - a) * 1000 for a, b in zip(arrivals, arrivals[1:])]
         out[f.camera_id] = {
-            'frames_shown': len(times),
+            'frames_shown': len(times), 'outages_over_2s': sum(g > 2000 for g in all_gaps),
             'shown_interval_ms': {'p50': percentile(gaps, .5), 'p95': percentile(gaps, .95),
                                   'cv': statistics.pstdev(gaps) / statistics.mean(gaps) if len(gaps) > 1 else None},
             'arrival_interval_ms_last60': {'p50': percentile(a_gaps, .5), 'p95': percentile(a_gaps, .95),
                                            'cv': statistics.pstdev(a_gaps) / statistics.mean(a_gaps) if len(a_gaps) > 1 else None},
             'smoothing_extra_ms': f.stats()['extra_ms'], 'metadata_mismatch_retries': f.mismatches}
     return out
+
+
+def _terminate(*_):
+    raise KeyboardInterrupt
 
 
 def main():
@@ -178,6 +185,7 @@ def main():
     p.add_argument('--duration', type=float, help='Stop after this many seconds')
     p.add_argument('--summary', default='performance_run/monitor_summary.json')
     args = p.parse_args()
+    signal.signal(signal.SIGTERM, _terminate)  # background start/stop scripts use SIGTERM
     root = Path(os.environ.get('PPE_MONITOR_DIR', str(Path(__file__).resolve().parent)))
     playout = None if args.playout == 'off' else 'auto' if args.playout == 'auto' else float(args.playout)
     feeds = [CameraFeed(root, c.strip(), playout) for c in args.cameras.split(',') if c.strip()]

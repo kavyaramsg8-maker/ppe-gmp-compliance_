@@ -268,3 +268,21 @@ def test_existing_event_database_is_migrated_not_lost(tmp_path):
         assert [e['zone'] for e in r.events()][:2] == ['production', None]
     finally:
         r.client.__exit__(None, None, None)
+
+
+def test_calibrated_polygon_env_and_observer_command(tmp_path, monkeypatch):
+    monkeypatch.setenv('PPE_HANDWASH_POLYGON', json.dumps([[0.6, 0.5], [0.9, 0.5], [0.9, 1.0], [0.6, 1.0]]))
+    z = load_zone_config()
+    assert z.zone_for('CAM_01', (0.7, 0.8)) == 'handwash' and z.zone_for('CAM_01', (0.7, 0.3)) == 'corridor'
+    monkeypatch.setenv('PPE_HANDWASH_POLYGON', '[[0.6, 0.5], [1.4, 0.5], [0.9, 1.0]]')
+    with pytest.raises(ValueError):
+        load_zone_config()
+    monkeypatch.delenv('PPE_HANDWASH_POLYGON')
+    r = Rig(tmp_path)
+    try:
+        r.client.get('/v1/devices/ESP32_01/command', params={'observer': 'true'}, headers=HEADERS)
+        assert r.client.get('/v1/devices/ESP32_01', headers=HEADERS).json()['online'] is False
+        r.command()
+        assert r.client.get('/v1/devices/ESP32_01', headers=HEADERS).json()['online'] is True
+    finally:
+        r.client.__exit__(None, None, None)

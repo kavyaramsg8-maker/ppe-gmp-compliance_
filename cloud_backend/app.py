@@ -465,9 +465,11 @@ def create_app(settings: Settings | None = None, now=None) -> FastAPI:
                     valid_for_seconds=settings.stale_seconds, cameras=states, issued_at=now().isoformat())
 
     @app.get('/v1/devices/{device_id}/command', dependencies=secured)
-    def poll_command(device_id: str):
+    def poll_command(device_id: str, observer: bool = False):
         with lock:
             cmd = device_command(device_id)
+            if observer:
+                return cmd  # monitoring tools: do not mark the device as online
             db.execute('INSERT INTO device_state(device_id,last_seen) VALUES (?,?) ON CONFLICT(device_id) DO UPDATE SET last_seen=excluded.last_seen', (device_id, now().isoformat()))
             db.commit()
             return cmd

@@ -55,7 +55,8 @@ def main():
             clicks.append((round(x / w, 3), round(y / h, 3)))
             print(f'point {len(clicks)}: [{clicks[-1][0]:.3f}, {clicks[-1][1]:.3f}]')
             if len(clicks) >= 3:
-                print('        polygon: [' + ', '.join(f'[{a:.3f}, {b:.3f}]' for a, b in clicks) + ']')
+                text = '[' + ', '.join(f'[{a:.3f}, {b:.3f}]' for a, b in clicks) + ']'
+                print(f'        polygon: {text}\n        Render env: PPE_HANDWASH_POLYGON={text}')
 
     cv2.namedWindow('zones'); cv2.setMouseCallback('zones', on_mouse)
     print(__doc__)
