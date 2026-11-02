@@ -1,0 +1,10 @@
+{
+  "branch": "demo-setup",
+  "commit": "2ee36267bd7129ae2d50700e80bb653cea895f8e",
+  "original_blobs": {
+    "ai_detector.py": "ab8da841e1b03d3b957507a3bc68657bcc556d8c",
+    "monitor.py": "e84dee429c2924b22ee2aa0e3b7df015726db8c2",
+    "cloud_backend/worker.py": "98f932b04e5c20880a450adebc2b92016c42eea9",
+    "cloud_backend/camera.html": "ad68289f65e62d3c7e2749f065c7a1c6d782ed25"
+  }
+}

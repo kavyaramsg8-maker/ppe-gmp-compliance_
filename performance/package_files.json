@@ -1,0 +1,16 @@
+[
+  "ai_detector.py",
+  "monitor.py",
+  "cloud_backend/worker.py",
+  "cloud_backend/camera.html",
+  "performance_tools.py",
+  "benchmark_performance.py",
+  "compare_performance.py",
+  "requirements-performance.txt",
+  "PERFORMANCE_START_HERE.md",
+  "performance/baseline_detector.py",
+  "performance/base.json",
+  "performance/VALIDATION.md",
+  "performance/package_files.json",
+  "tests_cloud/test_performance.py"
+]

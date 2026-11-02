@@ -4,6 +4,37 @@ from ultralytics import YOLO
 import mediapipe as mp
 import os
 import time
+import json
+from pathlib import Path
+from threading import RLock
+from performance_tools import atomic_bytes, rss_mib
+import torch
+
+ROOT=Path(__file__).resolve().parent
+_DEVICE=os.environ.get('PPE_DEVICE','auto')
+if _DEVICE=='auto':
+    _DEVICE='cuda:0' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+PPE_IMGSZ=int(os.environ.get('PPE_IMGSZ','640'))
+PERSON_IMGSZ=int(os.environ.get('PPE_PERSON_IMGSZ','416'))
+POSE_COMPLEXITY=int(os.environ.get('PPE_POSE_COMPLEXITY','1'))
+if PPE_IMGSZ<160 or PERSON_IMGSZ<160:raise ValueError('Image sizes must be >=160')
+_detector_lock=RLock()
+_sessions={}
+_last_metrics={}
+
+def _sync():
+    if _DEVICE.startswith('cuda'):torch.cuda.synchronize()
+    elif _DEVICE=='mps':torch.mps.synchronize()
+
+def _session(camera_id,session_id):
+    old=_sessions.get(camera_id)
+    if old is None or old['session_id']!=session_id:
+        if old is None and len(_sessions)>=8:raise ValueError('Too many cameras')
+        _sessions[camera_id]={'session_id':session_id,'person_model':YOLO(str(ROOT/'yolov8n.pt')),'timers':{},'wrists':{}}
+    return _sessions[camera_id]
+
+def get_metrics(camera_id):
+    return dict(_last_metrics.get(camera_id,{}))
 
 # =========================================================
 # 1. ZONE AND TIMER CONFIGURATION
@@ -20,30 +51,24 @@ CAMERA_ZONE_MAP = {
 SINK_ZONE_X_START = 320  # Assuming 640px width video
 HANDWASH_MIN_SECONDS = 20
 
-# Global dictionaries to track state across frames
-handwash_timers = {}
-wrist_history = {}
 
 # =========================================================
 # 2. MODEL SETUP
 # =========================================================
 # Load your models
-ppe_model = YOLO('best.pt')
-person_model = YOLO('yolov8n.pt')
+ppe_model = YOLO(str(ROOT/'best.pt'))
 
 # Setup MediaPipe
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True)
+pose = mp_pose.Pose(static_image_mode=True,model_complexity=POSE_COMPLEXITY)
 
 # =========================================================
 # 3. HELPER FUNCTIONS
 # =========================================================
-def check_face_touch(person_crop, tau=0.4):
+def check_face_touch(person_crop, results, tau=0.4):
     if person_crop.size == 0:
         return False
     h, w = person_crop.shape[:2]
-    rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb_crop)
     if not results.pose_landmarks:
         return False
     lm = results.pose_landmarks.landmark
@@ -64,15 +89,13 @@ def check_face_touch(person_crop, tau=0.4):
     rdist = np.linalg.norm(nose - rwrist) / shoulder_width
     return min(ldist, rdist) < tau
 
-def check_handwash_motion(person_crop, track_id):
+def check_handwash_motion(person_crop, track_id, results, history):
     """
     Detects if hands are close together AND moving (rubbing motion).
     """
     if person_crop.size == 0:
         return False
     h, w = person_crop.shape[:2]
-    rgb_crop = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb_crop)
     
     if not results.pose_landmarks:
         return False
@@ -96,11 +119,11 @@ def check_handwash_motion(person_crop, track_id):
     # 2. Are hands moving? (Compare to previous frame)
     current_pos = (lwrist + rwrist) / 2
     movement = 0
-    if track_id in wrist_history:
-        prev_pos = wrist_history[track_id]
+    if track_id in history:
+        prev_pos = history[track_id]
         movement = np.linalg.norm(current_pos - prev_pos)
         
-    wrist_history[track_id] = current_pos
+    history[track_id] = current_pos
     
     # Thresholds (Adjust based on resolution)
     HANDS_CLOSE_THRESHOLD = 120 # Pixels
@@ -123,15 +146,30 @@ def is_contained(item_box, person_box, threshold=0.5):
 # 4. MAIN DETECTION FUNCTION
 # =========================================================
 def detect(frame_content, camera_id, session_id):
+    # Shared PPE/pose models execute serially; network work may overlap.
+    with _detector_lock:
+        return _detect(frame_content,camera_id,session_id)
+
+def _detect(frame_content, camera_id, session_id):
+    started=time.perf_counter()
+    state=_session(camera_id,session_id)
+    person_model=state['person_model']
+    handwash_timers=state['timers']
+    wrist_history=state['wrists']
+
     # Decode image
     nparr = np.frombuffer(frame_content, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if frame is None:
-        return []
+        raise ValueError("Invalid JPEG; no inference result submitted")
 
     # Run inference
-    ppe_results = ppe_model(frame, conf=0.15, verbose=False)[0]
-    person_results = person_model.track(frame, persist=True, tracker='bytetrack.yaml', verbose=False)[0]
+    _sync();t=time.perf_counter()
+    ppe_results = ppe_model(frame,conf=0.15,imgsz=PPE_IMGSZ,device=_DEVICE,verbose=False)[0]
+    _sync();ppe_ms=(time.perf_counter()-t)*1000;t=time.perf_counter()
+    person_results = person_model.track(frame,classes=[0],conf=.4,imgsz=PERSON_IMGSZ,device=_DEVICE,persist=True,tracker='bytetrack.yaml',verbose=False)[0]
+    _sync();person_ms=(time.perf_counter()-t)*1000
+    pose_ms=0.0;pose_calls=0
 
     persons = []
     ppe_items = []
@@ -167,7 +205,10 @@ def detect(frame_content, camera_id, session_id):
         px1, py1, px2, py2 = map(int, person['box'])
         person_crop = frame[max(0, py1): min(frame.shape[0], py2), max(0, px1): min(frame.shape[1], px2)]
         
-        face_touch = check_face_touch(person_crop)
+        t=time.perf_counter()
+        pose_result=pose.process(cv2.cvtColor(person_crop,cv2.COLOR_BGR2RGB)) if person_crop.size else None
+        pose_ms+=(time.perf_counter()-t)*1000;pose_calls+=int(bool(person_crop.size))
+        face_touch = check_face_touch(person_crop,pose_result) if pose_result is not None else False
         associated_ppe = []
         
         for item in ppe_items:
@@ -194,7 +235,7 @@ def detect(frame_content, camera_id, session_id):
                 current_zone = "sink_zone"
                 
                 # Check if action is happening
-                is_washing = check_handwash_motion(person_crop, track_id)
+                is_washing = check_handwash_motion(person_crop, track_id,pose_result,wrist_history) if pose_result is not None else False
                 
                 if is_washing:
                     if track_id not in handwash_timers:
@@ -263,9 +304,15 @@ def detect(frame_content, camera_id, session_id):
             del wrist_history[tid]
 
     # Save annotated frame for the monitor
-    cv2.imwrite(f"live_{camera_id}.jpg", frame)
+    folder=Path(os.environ.get('PPE_MONITOR_DIR',str(ROOT)));folder.mkdir(parents=True,exist_ok=True)
+    ok,jpeg=cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,80])
+    if not ok:raise RuntimeError('Preview JPEG encoding failed')
+    atomic_bytes(folder/f'live_{camera_id}.jpg',jpeg.tobytes())
+    metrics={'detector_ms':(time.perf_counter()-started)*1000,'ppe_ms':ppe_ms,'person_ms':person_ms,'pose_ms':pose_ms,'pose_calls':pose_calls,'people':len(output_persons),'device':_DEVICE,'ppe_imgsz':PPE_IMGSZ,'person_imgsz':PERSON_IMGSZ,'rss_mib':rss_mib()}
+    _last_metrics[camera_id]=metrics
+    atomic_bytes(folder/f'live_{camera_id}.metrics.json',json.dumps(metrics).encode())
     
-    if len(output_persons) > 0:
+    if os.environ.get('PPE_DEBUG')=='1' and len(output_persons) > 0:
         print(f"DEBUG: {camera_id} ({current_zone}) | PPE: {output_persons[0]['associated_ppe']} | Wash: {output_persons[0]['handwash_status']}")
         
     return output_persons

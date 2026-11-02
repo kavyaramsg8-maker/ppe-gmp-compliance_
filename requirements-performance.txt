@@ -1,0 +1,3 @@
+# Add to the existing WORKING Python 3.11 environment; do not reinstall Torch/MediaPipe.
+psutil>=5.9,<8
+ultralytics-thop>=2,<3
